@@ -1,0 +1,18 @@
+[package]
+name = "diffed-places"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.54", features = ["derive"] }
+memmap2 = "0.9.9"
+piz = "0.5.1"
+rayon = "1.11.0"
+regex = "1.12.2"
+serde = "1.0.228"
+serde_json = "1.0.148"
+
+[dev-dependencies]
+assert_cmd = "2.1.1"
+predicates = "3.1.3"

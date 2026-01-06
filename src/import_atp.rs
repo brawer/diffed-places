@@ -5,9 +5,18 @@ use geojson::GeoJson;
 use memmap2::Mmap;
 use piz::ZipArchive;
 use rayon::prelude::*;
+use s2;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Place {
+    s2_cell_id: u64,
+    point: geo::Point,
+    tags: Vec<(String, String)>,
+}
 
 pub fn import_atp(input: &PathBuf) -> Result<()> {
     let file = File::open(input).with_context(|| format!("could not open file `{:?}`", input))?;
@@ -53,13 +62,47 @@ fn process_geojson<T: Read>(reader: T) -> Result<()> {
         } else {
             &line
         };
-        let feature = trimmed.parse::<GeoJson>()?;
-        if let Some(pt) = find_point(&feature) {
-            println!("*** {:?}", pt);
-        }
+        let Some(place) = make_place(trimmed) else {
+            continue;
+        };
+        println!("*** GIRAFFE {:?}", place);
     }
     println!("{:?}", spider_attrs);
     Ok(())
+}
+
+fn make_place(geojson: &str) -> Option<Place> {
+    let parsed = geojson.parse::<GeoJson>().ok()?;
+    let point = find_point(&parsed)?;
+    let s2_lat_lng = s2::latlng::LatLng::from_degrees(point.y(), point.x());
+    let s2_cell_id = s2::cellid::CellID::from(s2_lat_lng).0;
+    let GeoJson::Feature(feature) = parsed else {
+        return None;
+    };
+    let tags = properties_to_tags(&feature.properties?);
+    Some(Place {
+        s2_cell_id,
+        point,
+        tags,
+    })
+}
+
+fn properties_to_tags(
+    properties: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<(String, String)> {
+    let mut tags: Vec<(String, String)> = properties
+        .iter()
+        .filter_map(|(key, value)| {
+            // Only keep properties where the value is a string
+            if let serde_json::Value::String(s) = value {
+                Some((key.clone(), s.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    tags.sort();
+    tags
 }
 
 /// Finds a representative point for a GeoJson feature.
@@ -84,7 +127,7 @@ fn find_point(geojson: &GeoJson) -> Option<Point> {
                 None
             }
         }
-	_ => geom.interior_point()
+        _ => geom.interior_point(),
     }
 }
 
@@ -93,47 +136,58 @@ mod tests {
     use geo::Point;
     use geojson::GeoJson;
 
+    // A point feature for testing.
+    const PLAYGROUND: &str = r#"{
+       "type": "Feature",
+       "properties": {
+           "leisure": "playground",
+           "addr:street": "Hermann-G\u00f6tz-Strasse",
+           "addr:city": "Winterthur",
+           "operator": "Stadtgr\u00fcn Winterthur",
+           "operator:wikidata": "Q56825906",
+           "@spider": "winterthur_ch"
+       },
+       "geometry": {
+           "type": "Point",
+           "coordinates": [8.7339982, 47.5039168]
+        }
+    }"#;
+
+    const BICYCLE_ROAD: &str = r#"{
+       "type": "Feature",
+       "properties": {
+           "@spider": "bern_ch",
+           "highway": "residential",
+           "bicycle_road": "yes"
+       },
+       "geometry": {
+           "type": "LineString",
+           "coordinates": [
+               [7.458535, 46.940702],
+               [7.458746, 46.941164],
+               [7.458778, 46.941229],
+               [7.459291, 46.942315],
+               [7.459298, 46.942329],
+               [7.459647, 46.943080],
+               [7.460838, 46.943692]
+           ]
+       }
+    }"#;
+
     fn find_point(geojson: &str) -> Option<Point> {
         super::find_point(&geojson.parse::<GeoJson>().unwrap())
     }
 
     #[test]
     fn test_find_point_for_point() {
-        let geojson = r#"{
-           "type": "Feature",
-           "geometry": {
-               "type": "Point",
-               "coordinates": [7.45, 46.95]
-            }
-        }"#;
-        let pt = find_point(&geojson).unwrap();
-        assert!((pt.x() - 7.45).abs() < 1e-7);
-        assert!((pt.y() - 46.95).abs() < 1e-7);
+        let pt = find_point(PLAYGROUND).unwrap();
+        assert!((pt.x() - 8.7339982).abs() < 1e-7);
+        assert!((pt.y() - 47.5039168).abs() < 1e-7);
     }
 
     #[test]
-    fn test_find_point_for_linestring() {
-        let geojson = r#"{
-           "type": "Feature",
-           "geometry": {
-               "type": "LineString",
-               "properties": {
-                   "@spider": "bern_ch",
-                   "highway": "residential",
-                   "bicycle_road": "yes"
-               },
-               "coordinates": [
-                   [7.458535, 46.940702],
-                   [7.458746, 46.941164],
-                   [7.458778, 46.941229],
-                   [7.459291, 46.942315],
-                   [7.459298, 46.942329],
-                   [7.459647, 46.943080],
-                   [7.460838, 46.943692]
-               ]
-           }
-        }"#;
-        let pt = find_point(&geojson).unwrap();
+    fn test_find_point_for_line_string() {
+        let pt = find_point(&BICYCLE_ROAD).unwrap();
         assert!((pt.x() - 7.4593195).abs() < 1e-6);
         assert!((pt.y() - 46.9423753).abs() < 1e-6);
     }
@@ -161,5 +215,42 @@ mod tests {
         let pt = find_point(&geojson).unwrap();
         assert!((pt.x() - -72.4474).abs() < 1e-3);
         assert!((pt.y() - 25.3935).abs() < 1e-3);
+    }
+
+    fn format_tags(tags: &Vec<(String, String)>) -> Vec<String> {
+        tags.into_iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect()
+    }
+
+    #[test]
+    fn test_make_place() {
+        let place = super::make_place(PLAYGROUND).unwrap();
+        assert_eq!(place.s2_cell_id, 5159605115004699013);
+        assert!((place.point.x() - 8.7339982).abs() < 1e-7);
+        assert!((place.point.y() - 47.5039168).abs() < 1e-7);
+        assert_eq!(
+            format_tags(&place.tags),
+            [
+                "@spider=winterthur_ch",
+                "addr:city=Winterthur",
+                "addr:street=Hermann-Götz-Strasse",
+                "leisure=playground",
+                "operator=Stadtgrün Winterthur",
+                "operator:wikidata=Q56825906"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_make_place_for_line_string() {
+        let place = super::make_place(BICYCLE_ROAD).unwrap();
+        assert_eq!(place.s2_cell_id, 5156122231380170133);
+        assert!((place.point.x() - 7.4593195).abs() < 1e-6);
+        assert!((place.point.y() - 46.9423753).abs() < 1e-6);
+        assert_eq!(
+            format_tags(&place.tags),
+            ["@spider=bern_ch", "bicycle_road=yes", "highway=residential"]
+        );
     }
 }

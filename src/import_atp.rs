@@ -1,7 +1,7 @@
 use anyhow::{Context, Ok, Result};
 use geo::algorithm::line_measures::Haversine;
-use geo::{InteriorPoint, InterpolateLine, Point, Polygon};
-use geojson::{GeoJson, Value};
+use geo::{InteriorPoint, InterpolateLine, Point};
+use geojson::GeoJson;
 use memmap2::Mmap;
 use piz::ZipArchive;
 use rayon::prelude::*;
@@ -62,11 +62,7 @@ fn process_geojson<T: Read>(reader: T) -> Result<()> {
     Ok(())
 }
 
-fn make_line_string(coords: &Vec<Vec<f64>>) -> geo::LineString {
-    let points: Vec<(f64, f64)> = coords.iter().map(|p| (p[0], p[1])).collect();
-    geo::LineString::from(points)
-}
-
+/// Finds a representative point for a GeoJson feature.
 fn find_point(geojson: &GeoJson) -> Option<Point> {
     let GeoJson::Feature(f) = geojson else {
         return None;
@@ -74,22 +70,21 @@ fn find_point(geojson: &GeoJson) -> Option<Point> {
     let Some(geometry) = &f.geometry else {
         return None;
     };
-    match &geometry.value {
-        Value::Point(coords) => Some(Point::new(coords[0], coords[1])),
-        Value::LineString(lines) => {
-            let line_string = make_line_string(lines);
+    let Some(geom) = TryInto::<geo::Geometry<f64>>::try_into(geometry).ok() else {
+        return None;
+    };
+    match geom {
+        geo::Geometry::LineString(line_string) => {
             Haversine.point_at_ratio_from_start(&line_string, 0.5)
         }
-        Value::Polygon(poly) => {
-            let exterior = make_line_string(&poly[0]);
-            let interiors: Vec<geo::LineString<f64>> = poly[1..]
-                .iter()
-                .map(|ring| make_line_string(&ring))
-                .collect();
-            let polygon = Polygon::new(exterior, interiors);
-            polygon.interior_point()
+        geo::Geometry::MultiLineString(mls) => {
+            if !mls.0.is_empty() {
+                Haversine.point_at_ratio_from_start(&mls.0[0], 0.5)
+            } else {
+                None
+            }
         }
-        _ => None,
+	_ => geom.interior_point()
     }
 }
 

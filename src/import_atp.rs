@@ -1,16 +1,17 @@
 use anyhow::{Context, Ok, Result};
+use ext_sort::{buffer::mem::MemoryLimitedBufferBuilder, ExternalSorter, ExternalSorterBuilder};
 use geo::algorithm::line_measures::Haversine;
 use geo::{InteriorPoint, InterpolateLine, Point};
 use geojson::GeoJson;
 use memmap2::Mmap;
 use piz::ZipArchive;
 use rayon::prelude::*;
-use s2;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Place {
@@ -19,23 +20,63 @@ struct Place {
     tags: Vec<(String, String)>,
 }
 
+impl deepsize::DeepSizeOf for Place {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        8 + 16 + self.tags.deep_size_of_children(context)
+    }
+}
+
+// Implement Eq (marker trait, no methods to implement)
+impl Eq for Place {}
+
+impl Ord for Place {
+    fn cmp(&self, other: &Self) -> Ordering {
+        //println!("cmp({}, {})", self.s2_cell_id, other.s2_cell_id);
+        self.s2_cell_id
+            .cmp(&other.s2_cell_id)
+            .then(self.tags.cmp(&other.tags))
+    }
+}
+
+impl PartialEq for Place {
+    fn eq(&self, other: &Self) -> bool {
+        self.s2_cell_id == other.s2_cell_id && self.tags == other.tags
+    }
+}
+
+impl PartialOrd for Place {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 pub fn import_atp(input: &PathBuf) -> Result<()> {
-    let mut ra: Result<()> = Ok(());
-    let mut rb: Result<()> = Ok(());
-    let (tx, rx) = sync_channel(1000);
-    rayon::scope(|s| {
-        s.spawn(|_| ra = process_places(rx));
-        s.spawn(|_| rb = process_zip(input, tx));
+    // To avoid deadlock, we must not use Rayon threads here.
+    // https://dev.to/sgchris/scoped-threads-with-stdthreadscope-in-rust-163-48f9
+    let (tx, rx) = sync_channel(50_000);
+    let (ra, rb) = std::thread::scope(|s| {
+        let r1 = s.spawn(|| process_places(rx));
+        let r2 = s.spawn(|| process_zip(input, tx));
+        (r1.join().unwrap(), r2.join().unwrap())
     });
     ra?;
     rb?;
     Ok(())
 }
 
-fn process_places(channel: Receiver<Place>) -> Result<()> {
+fn process_places(places: Receiver<Place>) -> Result<()> {
+    let mut out = BufWriter::new(File::create("output.txt")?);
+    let sorter: ExternalSorter<Place, std::io::Error, MemoryLimitedBufferBuilder> =
+        ExternalSorterBuilder::new()
+            .with_tmp_dir(Path::new("./"))
+            .with_buffer(MemoryLimitedBufferBuilder::new(150_000_000))
+            .build()?;
+
+    let sorted = sorter.sort(places.iter().map(std::io::Result::Ok))?;
     let mut num_places = 0;
-    for _place in channel.iter() {
+    for place in sorted {
         num_places += 1;
+        out.write_all(format!("{}\n", place?.s2_cell_id).as_bytes())?;
     }
     println!("got {} places", num_places);
     Ok(())
@@ -64,10 +105,10 @@ fn process_geojson<T: Read>(reader: T, channel: SyncSender<Place>) -> Result<()>
 
         // Handle start of FeatureCollection, first line in file.
         if line.starts_with("{\"type\":\"FeatureCollection\"") {
-            let mut json = String::from(line);
+            let mut json = line;
             json.push_str("]}");
-            let val: serde_json::Value = serde_json::from_str(&json)?;
-            if let Some(_attrs) = val.get("dataset_attributes") {}
+            let _parsed = json.parse::<geojson::FeatureCollection>()?;
+            // TODO: Collect bounding box and attributes?
             continue;
         }
 
@@ -112,7 +153,7 @@ fn properties_to_tags(
     let mut tags: Vec<(String, String)> = properties
         .iter()
         .filter_map(|(key, value)| {
-            // Only keep properties where the value is a string
+            // Only keep properties where the value is a string.
             if let serde_json::Value::String(s) = value {
                 Some((key.clone(), s.clone()))
             } else {
@@ -132,9 +173,7 @@ fn find_point(geojson: &GeoJson) -> Option<Point> {
     let Some(geometry) = &f.geometry else {
         return None;
     };
-    let Some(geom) = TryInto::<geo::Geometry<f64>>::try_into(geometry).ok() else {
-        return None;
-    };
+    let geom = TryInto::<geo::Geometry<f64>>::try_into(geometry).ok()?;
     match geom {
         geo::Geometry::LineString(line_string) => {
             Haversine.point_at_ratio_from_start(&line_string, 0.5)

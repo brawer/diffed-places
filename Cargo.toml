@@ -6,6 +6,9 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 clap = { version = "4.5.54", features = ["derive"] }
+deepsize = "0.2.0"
+deepsize_derive = "0.1.2"
+ext-sort = { version = "0.1.5", features = ["memory-limit"] }
 geo = "0.32.0"
 geo-types = "0.7.18"
 geojson = "0.24.2"

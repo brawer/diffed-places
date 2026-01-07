@@ -1,4 +1,5 @@
 use anyhow::{Context, Ok, Result};
+use arrow::datatypes::{DataType, Field, Schema};
 use ext_sort::{buffer::mem::MemoryLimitedBufferBuilder, ExternalSorter, ExternalSorterBuilder};
 use geo::algorithm::line_measures::Haversine;
 use geo::{InteriorPoint, InterpolateLine, Point};
@@ -8,10 +9,12 @@ use piz::ZipArchive;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use wkb::writer::point_wkb_size;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Place {
@@ -65,6 +68,7 @@ pub fn import_atp(input: &PathBuf) -> Result<()> {
 }
 
 fn process_places(places: Receiver<Place>) -> Result<()> {
+    let _schema = make_parquet_schema();
     let mut out = BufWriter::new(File::create("output.txt")?);
     let sorter: ExternalSorter<Place, std::io::Error, MemoryLimitedBufferBuilder> =
         ExternalSorterBuilder::new()
@@ -187,6 +191,28 @@ fn find_point(geojson: &GeoJson) -> Option<Point> {
         }
         _ => geom.interior_point(),
     }
+}
+
+fn make_parquet_schema() -> Schema {
+    use std::sync::Arc;
+
+    // Metadata for GEOMETRY logical type
+    let mut point_metadata = HashMap::new();
+    point_metadata.insert(
+        "ARROW:extension:metadata".to_string(),
+        r#"{"logicalType": "GEOMETRY"}"#.to_string(),
+    );
+    let point_size = point_wkb_size(geo_traits::Dimensions::Xy);
+    Schema::new(vec![
+        Field::new("point", DataType::FixedSizeBinary(point_size as i32), false)
+            .with_metadata(point_metadata),
+        Field::new(
+            "tags",
+            DataType::Map(Arc::new(Field::new("entries", DataType::Utf8, true)), false),
+            false,
+        ),
+        Field::new("spider", DataType::Utf8, false),
+    ])
 }
 
 #[cfg(test)]

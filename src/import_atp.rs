@@ -1,5 +1,5 @@
 use anyhow::{Context, Ok, Result};
-use ext_sort::{buffer::mem::MemoryLimitedBufferBuilder, ExternalSorter, ExternalSorterBuilder};
+use ext_sort::{ExternalSorter, ExternalSorterBuilder, buffer::mem::MemoryLimitedBufferBuilder};
 use geo::algorithm::line_measures::Haversine;
 use geo::{InteriorPoint, InterpolateLine, Point};
 use geojson::GeoJson;
@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 use crate::place::{ParquetWriter, Place};
 
@@ -272,8 +272,8 @@ mod tests {
     #[test]
     fn test_make_place() {
         let place = super::make_place(PLAYGROUND).unwrap();
-	assert_eq!(place.lon_e7, 8_7339982);
-	assert_eq!(place.lat_e7, 47_5039168);
+        assert_eq!(place.lon_e7, 8_7339982);
+        assert_eq!(place.lat_e7, 47_5039168);
         assert_eq!(place.source_id, "atp/winterthur_ch");
         assert_eq!(place.source_url, None);
         assert_eq!(
@@ -291,10 +291,10 @@ mod tests {
     #[test]
     fn test_make_place_for_line_string() {
         let place = super::make_place(BICYCLE_ROAD).unwrap();
-	assert_eq!(place.lon_e7, 7_4593195);
-	assert_eq!(place.lat_e7, 46_9423753);
+        assert_eq!(place.lon_e7, 7_4593195);
+        assert_eq!(place.lat_e7, 46_9423753);
         assert_eq!(place.source_id, "atp/bern_ch");
-	let source_url = place.source_url.clone().unwrap();
+        let source_url = place.source_url.clone().unwrap();
         assert_eq!(
             source_url,
             "https://map.bern.ch/ogd/poi_velo/poi_velo_json.zip"

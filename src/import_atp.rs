@@ -102,8 +102,7 @@ fn make_place(geojson: &str) -> Option<Place> {
     };
     let properties = feature.properties?;
 
-    let mut source_id: Option<String> = None;
-    let mut source_url: Option<String> = None;
+    let mut source: Option<String> = None;
 
     // We strip three properties ("nsi_id", "@spider", "@source_uri") from tags,
     // so we do not need to reserve space for them.
@@ -132,12 +131,7 @@ fn make_place(geojson: &str) -> Option<Place> {
 
         if key == "@spider" {
             value.insert_str(0, "atp/");
-            source_id = Some(value);
-            continue;
-        }
-
-        if key == "@source_uri" {
-            source_url = Some(value);
+            source = Some(value);
             continue;
         }
 
@@ -147,7 +141,7 @@ fn make_place(geojson: &str) -> Option<Place> {
 
         tags.push((key, value));
     }
-    Place::new(&point, source_id?, source_url, tags)
+    Place::new(&point, source?, tags)
 }
 
 /// Finds a representative point for a GeoJson feature.
@@ -273,10 +267,7 @@ mod tests {
     #[test]
     fn test_make_place() {
         let place = super::make_place(PLAYGROUND).unwrap();
-        assert_eq!(place.lon_e7, 8_7339982);
-        assert_eq!(place.lat_e7, 47_5039168);
-        assert_eq!(place.source_id, "atp/winterthur_ch");
-        assert_eq!(place.source_url, None);
+        assert_eq!(place.source, "atp/winterthur_ch");
         assert_eq!(
             tags(&place),
             [
@@ -292,14 +283,7 @@ mod tests {
     #[test]
     fn test_make_place_for_line_string() {
         let place = super::make_place(BICYCLE_ROAD).unwrap();
-        assert_eq!(place.lon_e7, 7_4593195);
-        assert_eq!(place.lat_e7, 46_9423753);
-        assert_eq!(place.source_id, "atp/bern_ch");
-        let source_url = place.source_url.clone().unwrap();
-        assert_eq!(
-            source_url,
-            "https://map.bern.ch/ogd/poi_velo/poi_velo_json.zip"
-        );
+        assert_eq!(place.source, "atp/bern_ch");
         assert_eq!(
             tags(&place),
             [("bicycle_road", "yes"), ("highway", "residential"),]

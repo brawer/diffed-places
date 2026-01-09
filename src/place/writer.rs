@@ -1,7 +1,7 @@
 use super::Place;
 use anyhow::{Ok, Result};
 use arrow::{
-    array::{ArrayRef, Int32Array, MapArray, StringArray, StructArray, UInt64Array},
+    array::{ArrayRef, MapArray, StringArray, StructArray, UInt64Array},
     buffer::OffsetBuffer,
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
@@ -58,26 +58,11 @@ impl ParquetWriter {
         let s2_cell_ids = Arc::new(UInt64Array::from_iter(
             self.places.iter().map(|p| p.s2_cell_id),
         ));
-        let longitudes = Arc::new(Int32Array::from_iter(self.places.iter().map(|p| p.lon_e7)));
-        let latitudes = Arc::new(Int32Array::from_iter(self.places.iter().map(|p| p.lat_e7)));
-        let source_ids = Arc::new(StringArray::from_iter_values(
-            self.places.iter().map(|p| p.source_id.as_str()),
-        ));
-        let source_urls = Arc::new(StringArray::from_iter(
-            self.places.iter().map(|p| p.source_url.as_deref()),
+        let sources = Arc::new(StringArray::from_iter_values(
+            self.places.iter().map(|p| p.source.as_str()),
         ));
         let tags = make_tags(&self.places, self.num_tags);
-        let batch = RecordBatch::try_new(
-            self.schema.clone(),
-            vec![
-                s2_cell_ids,
-                longitudes,
-                latitudes,
-                source_ids,
-                source_urls,
-                tags,
-            ],
-        )?;
+        let batch = RecordBatch::try_new(self.schema.clone(), vec![s2_cell_ids, sources, tags])?;
         self.writer.write(&batch)?;
         self.places.clear();
         self.num_tags = 0;
@@ -136,10 +121,7 @@ fn make_tags(places: &[Place], num_tags: usize) -> Arc<MapArray> {
 fn make_schema() -> Schema {
     Schema::new(vec![
         Field::new("s2_cell_id", DataType::UInt64, /* nullable */ false),
-        Field::new("longitude_e7", DataType::Int32, /* nullable */ false),
-        Field::new("latitude_e7", DataType::Int32, /* nullable */ false),
-        Field::new("source_id", DataType::Utf8, /* nullable */ false),
-        Field::new("source_url", DataType::Utf8, /* nullable */ true),
+        Field::new("source", DataType::Utf8, /* nullable */ false),
         Field::new(
             "tags",
             DataType::Map(

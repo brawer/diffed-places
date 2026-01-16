@@ -3,9 +3,11 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod coverage;
 mod import_atp;
 mod place;
 
+use crate::coverage::build_coverage;
 use crate::import_atp::import_atp;
 
 #[derive(Parser)]
@@ -24,6 +26,13 @@ enum Commands {
         #[arg(short, long, value_name = "alltheplaces.parquet")]
         output: PathBuf,
     },
+    BuildCoverage {
+        #[arg(short, long, value_name = "alltheplaces.parquet")]
+        places: PathBuf,
+
+        #[arg(short, long, value_name = "spatial-coverage")]
+        out_spatial_coverage: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -31,6 +40,12 @@ fn main() -> Result<()> {
     match &args.command {
         Some(Commands::ImportAtp { input, output }) => {
             import_atp(input, output)?;
+        }
+        Some(Commands::BuildCoverage {
+            places,
+            out_spatial_coverage,
+        }) => {
+            build_coverage(places, out_spatial_coverage)?;
         }
         None => {
             eprintln!("no subcommand given");

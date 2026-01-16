@@ -12,6 +12,7 @@ use s2::{
     s1::{Angle, ChordAngle},
 };
 use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
@@ -22,7 +23,7 @@ pub fn build_coverage(places: &Path, output: &Path) -> Result<()> {
     let (tx, rx) = sync_channel(50_000);
     std::thread::scope(|s| {
         let producer = s.spawn(|| read_places(places, tx));
-        let consumer = s.spawn(|| process_coverings(rx, output));
+        let consumer = s.spawn(|| build_spatial_coverage(rx, output));
         producer.join().unwrap().and(consumer.join().unwrap())
     })
 }
@@ -126,8 +127,8 @@ fn meters_to_chord_angle(radius_meters: f64) -> ChordAngle {
 }
 
 /// Builds a spatial coverage file from a stream of s2::CellIDs.
-fn process_coverings(cells: Receiver<CellID>, _out: &Path) -> Result<()> {
-    // let mut writer = bitmaps::Writer::try_new(out)?;
+fn build_spatial_coverage(cells: Receiver<CellID>, out: &Path) -> Result<()> {
+    let mut writer = CoverageWriter::try_new(out)?;
     let sorter: ExternalSorter<CellID, std::io::Error, LimitedBufferBuilder> =
         ExternalSorterBuilder::new()
             .with_tmp_dir(Path::new("./"))
@@ -137,12 +138,101 @@ fn process_coverings(cells: Receiver<CellID>, _out: &Path) -> Result<()> {
             .build()?;
     let sorted = sorter.sort(cells.iter().map(std::io::Result::Ok))?;
     for cur in sorted {
-        let _shifted = cur?.0 >> S2_CELL_ID_SHIFT;
-        // num_cells: 153903929 num_chunks: 421598 num_bitmaps: 384
-        // writer.write(cur?);
+        writer.write(cur?.0 >> S2_CELL_ID_SHIFT)?;
     }
-    // writer.close()?;
+    writer.close()?;
     Ok(())
+}
+
+struct CoverageWriter {
+    run_start_writer: BufWriter<File>,
+    run_length_writer: BufWriter<File>,
+
+    num_values: u64,
+    num_runs: u64,
+    run_start: Option<u64>,
+    run_length_minus_1: u8,
+}
+
+impl CoverageWriter {
+    fn try_new(path: &Path) -> Result<CoverageWriter> {
+        let file = File::create(path)?;
+        let run_start_writer = BufWriter::with_capacity(32768, file);
+        let run_length_path = path.with_extension("tmp_run_lengths");
+        let run_length_file = File::create(run_length_path)?;
+        let run_length_writer = BufWriter::with_capacity(32768, run_length_file);
+        // todo: write file header, with zero offsets to run_start and run_length
+        Ok(CoverageWriter {
+            run_start_writer,
+            run_length_writer,
+            num_values: 0,
+            num_runs: 0,
+            run_start: None,
+            run_length_minus_1: 0,
+        })
+    }
+
+    fn write(&mut self, value: u64) -> Result<()> {
+        let Some(run_start) = self.run_start else {
+            self.num_values = 1;
+            self.num_runs = 1;
+            self.run_start = Some(value);
+            self.run_length_minus_1 = 0;
+            return Ok(());
+        };
+
+        let run_end: u64 = run_start + (self.run_length_minus_1 as u64);
+        assert!(
+            value >= run_end,
+            "values not written in sort order: {} after {}",
+            value,
+            run_end
+        );
+
+        if value == run_end {
+            // If we write the same value twice, we don’t need to do anything.
+            return Ok(());
+        } else if value == run_end + 1 && self.run_length_minus_1 < 0xff {
+            // Extending the length of the current run, if there’s still
+            // enough space to hold the new length in the available 8 bits.
+            self.run_length_minus_1 += 1;
+            self.num_values += 1;
+            return Ok(());
+        }
+
+        // Start a new run with the current value.
+        self.finish_run()?;
+        self.run_start = Some(value);
+        self.run_length_minus_1 = 0;
+        self.num_values += 1;
+        Ok(())
+    }
+
+    fn close(mut self) -> Result<()> {
+        self.finish_run()?;
+        self.run_start_writer.flush()?;
+        self.run_length_writer.flush()?;
+
+        // todo: add runs at end of file
+
+        // todo: seek to header position, fix up positions
+        println!(
+            "got num_values={} num_runs={}",
+            self.num_values, self.num_runs
+        );
+        Ok(())
+    }
+
+    fn finish_run(&mut self) -> Result<()> {
+        let Some(run_start) = self.run_start else {
+            return Ok(());
+        };
+        self.run_start_writer.write_all(&run_start.to_le_bytes())?;
+        self.run_length_writer
+            .write_all(&[self.run_length_minus_1])?;
+        self.num_runs += 1;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

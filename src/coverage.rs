@@ -219,6 +219,7 @@ impl CoverageWriter {
         self.run_start = Some(value);
         self.run_length_minus_1 = 0;
         self.num_values += 1;
+        self.num_runs += 1;
         Ok(())
     }
 
@@ -226,10 +227,11 @@ impl CoverageWriter {
         self.finish_run()?;
         self.writer.flush()?;
 
-        // Add the run lengths, which are at this point in time in a temporary file,
+        // Append the run lengths, which are at this point in time in a temporary file,
         // to end end of the main file.
         let run_lengths_pos = self.writer.stream_position()?;
         self.run_lengths_writer.flush()?;
+        assert_eq!(self.run_lengths_writer.stream_position()?, self.num_runs);
         self.run_lengths_writer.seek(SeekFrom::Start(0))?;
 
         let run_lengths_path: &Path = self.run_lengths_path.as_path();
@@ -275,7 +277,6 @@ impl CoverageWriter {
         self.writer.write_all(&run_start.to_le_bytes())?;
         self.run_lengths_writer
             .write_all(&[self.run_length_minus_1])?;
-        self.num_runs += 1;
         Ok(())
     }
 }

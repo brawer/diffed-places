@@ -9,12 +9,14 @@
 #     podman build -t test-container -f Containerfile .
 #     podman run -t test-container --help
 
+# Workaround for https://github.com/brawer/diffed-places/issues/27
+ARG TARGET_PLATFORM  # eg. "linux/arm64", "linux/amd64"
 
 # ----------------------------------------------------------------------------
 #  Build Stage 1: Build, test, create Software Bill of Materials (SBOM)
 # ----------------------------------------------------------------------------
 
-FROM rust:1.92.0-alpine3.23 AS builder
+FROM --platform=$TARGET_PLATFORM rust:1.92.0-alpine3.23 AS builder
 
 WORKDIR /usr/diffed-places
 
@@ -27,6 +29,7 @@ COPY tests tests
 # let’s see if we can at least print a message from here.
 # TODO: Remove this once we’re found the problem.
 RUN echo "Hello world, greetings from an echo in a Containerfile."
+RUN uname -a
 
 RUN apk add --no-cache syft
 RUN cargo build --release

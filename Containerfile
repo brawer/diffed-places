@@ -11,7 +11,7 @@
 
 
 # ----------------------------------------------------------------------------
-#  Build Stage 1: Build/test the binary; create Software Bill of Materials
+#  Build Stage 1: Build, test, create Software Bill of Materials (SBOM)
 # ----------------------------------------------------------------------------
 
 FROM rust:1.92.0-alpine3.23 AS builder
@@ -22,15 +22,14 @@ COPY Cargo.toml Cargo.lock .
 COPY src src
 COPY tests tests
 
-RUN \
-    apk add syft &&  \
-    cargo build --release &&  \
-    cargo test --release &&  \
-    syft scan dir:. --source-name diffed-places -o cyclonedx-json=sbom.cdx.json
+RUN apk add syft
+RUN cargo build --release
+RUN cargo test --release
+RUN syft scan dir:. --source-name diffed-places -o cyclonedx-json=sbom.cdx.json
 
 
 # ----------------------------------------------------------------------------
-#  Build Stage 2: Package the final container
+#  Build Stage 2: Package build artifacts into an otherwise empty container
 # ----------------------------------------------------------------------------
 
 FROM scratch

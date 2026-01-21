@@ -56,7 +56,7 @@ jobs:
             --build-arg VCS_URL="${{ github.server_url }}/${{ github.repository }}" \
             -f ./Containerfile \
             -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }} \
-	    .
+            .
 
       - name: Push image
         run: |

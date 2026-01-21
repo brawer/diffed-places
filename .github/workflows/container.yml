@@ -11,7 +11,7 @@ env:
 
 jobs:
   build:
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.platform }}
     strategy:
       matrix:
         include:

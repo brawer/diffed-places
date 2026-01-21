@@ -22,9 +22,13 @@ COPY Cargo.toml Cargo.lock .
 COPY src src
 COPY tests tests
 
-RUN apk update
-RUN apk info syft
-RUN apk add syft
+# Our Continuous Integration does not seem to be able to execute
+# any commands when building on ARM for ARM. To debug the issue,
+# let’s see if we can at least print a message from here.
+# TODO: Remove this once we’re found the problem.
+RUN echo "Hello world, greetings from an echo in a Containerfile."
+
+RUN apk add --no-cache syft
 RUN cargo build --release
 RUN cargo test --release
 RUN syft scan dir:. --source-name diffed-places -o cyclonedx-json=sbom.cdx.json

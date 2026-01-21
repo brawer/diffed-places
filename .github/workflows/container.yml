@@ -26,7 +26,6 @@ jobs:
       contents: read
       packages: write
       id-token: write
-      attestations: write
 
     steps:
       - name: Checkout repository
@@ -37,16 +36,9 @@ jobs:
           sudo apt-get update
           sudo apt-get -y install podman
 
-      - name: Login to GitHub Container Registry via Podman
+      - name: Log in to GitHub Container Registry
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | podman login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
-
-      - name: Login to GitHub Container Registry via Docker
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Get commit timestamp
         id: commit
@@ -55,79 +47,24 @@ jobs:
           echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
 
       - name: Build image
+        id: build
         run: |
-          uname -a
-          podman --version
-          podman pull --platform ${{ matrix.platform }} rust:1.92.0-alpine3.23
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }}
           podman build \
             --platform ${{ matrix.platform }} \
-            --build-arg TARGET_PLATFORM="${{ matrix.platform }}" \
             --build-arg BUILD_TIMESTAMP="${{ steps.commit.outputs.timestamp }}" \
             --build-arg VCS_REF="${{ github.sha }}" \
             --build-arg VCS_URL="${{ github.server_url }}/${{ github.repository }}" \
             -f ./Containerfile \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }} \
+            -t $IMAGE \
             .
+          DIGEST=$(podman inspect $IMAGE --format='{{.Digest}}')
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
 
       - name: Push image
         run: |
-          podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }}
-
-      - name: Get image digest
-        id: digest
-        run: |
-          DIGEST=$(podman inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }} --format='{{.Digest}}')
-          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
-          echo "Digest: $DIGEST"
-
-      - name: Extract embedded SBOM from container
-        run: |
-          # Verify the SBOM label exists
-          SBOM_LABEL=$(podman inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }} \
-            --format='{{index .Config.Labels "org.opencontainers.image.sbom"}}')
-          echo "SBOM label: $SBOM_LABEL"
-
-          # Create a temporary container and extract the SBOM
-          CONTAINER_ID=$(podman create ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }})
-          podman cp ${CONTAINER_ID}:/sbom/sbom.cdx.json ./sbom-${{ matrix.arch }}.cdx.json
-          podman rm ${CONTAINER_ID}
-
-          # Verify SBOM was extracted
-          if [ ! -f "./sbom-${{ matrix.arch }}.cdx.json" ]; then
-            echo "Error: SBOM file not found"
-            exit 1
-          fi
-
-          echo "SBOM extracted successfully"
-          ls -lh ./sbom-${{ matrix.arch }}.cdx.json
-
-      - name: Attest SBOM
-        uses: actions/attest-sbom@v1
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.digest.outputs.digest }}
-          sbom-path: sbom-${{ matrix.arch }}.cdx.json
-          push-to-registry: true
-
-      - name: Generate provenance attestation
-        uses: actions/attest-build-provenance@v1
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.digest.outputs.digest }}
-          push-to-registry: true
-
-      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          echo "${{ steps.digest.outputs.digest }}" > /tmp/digests/${{ matrix.arch }}.txt
-
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-${{ matrix.arch }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
+          podman push ${{ steps.build.outputs.image }}
 
   merge:
     runs-on: ubuntu-latest
@@ -136,7 +73,6 @@ jobs:
       contents: read
       packages: write
       id-token: write
-      attestations: write
 
     steps:
       - name: Download digests
@@ -151,16 +87,9 @@ jobs:
           sudo apt-get update
           sudo apt-get -y install podman
 
-      - name: Log in to Container Registry via Podman
+      - name: Log in to Container Registry
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | podman login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
-
-      - name: Login to GitHub Container Registry via Docker
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create and push manifest
         id: manifest
@@ -191,16 +120,3 @@ jobs:
           FULL_DIGEST=$(podman inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} --format='{{.Digest}}')
           echo "digest=$FULL_DIGEST" >> $GITHUB_OUTPUT
           echo "Manifest Digest: $FULL_DIGEST"
-
-      - name: Attest multi-arch manifest
-        uses: actions/attest-build-provenance@v1
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.manifest.outputs.digest }}
-          push-to-registry: true
-
-      - name: Inspect manifest
-        run: |
-          podman manifest inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main
-          echo "---"
-          echo "Multi-arch manifest pushed with attestations"

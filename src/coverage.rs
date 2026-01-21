@@ -48,7 +48,11 @@ mod reader {
             };
 
             let value: u64 = cell.0 >> S2_CELL_ID_SHIFT;
-            let index = run_starts.partition_point(|&start| start <= value);
+            let index = if cfg!(target_endian = "little") {
+                run_starts.partition_point(|&start| start <= value)
+            } else {
+                run_starts.partition_point(|&start| start.swap_bytes() <= value)
+            };
             if index > 0 {
                 let start = run_starts[index - 1];
                 let limit = start + self.mmap[self.run_lengths_offset + index - 1] as u64;

@@ -22,6 +22,8 @@ COPY Cargo.toml Cargo.lock .
 COPY src src
 COPY tests tests
 
+RUN apk update
+RUN apk info syft
 RUN apk add syft
 RUN cargo build --release
 RUN cargo test --release

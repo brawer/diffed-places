@@ -37,9 +37,16 @@ jobs:
           sudo apt-get update
           sudo apt-get -y install podman
 
-      - name: Log in to GitHub Container Registry
+      - name: Login to GitHub Container Registry via Podman
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | podman login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+      - name: Login to GitHub Container Registry via Docker
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Get commit timestamp
         id: commit
@@ -144,9 +151,16 @@ jobs:
           sudo apt-get update
           sudo apt-get -y install podman
 
-      - name: Log in to Container Registry
+      - name: Log in to Container Registry via Podman
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | podman login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+      - name: Login to GitHub Container Registry via Docker
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create and push manifest
         id: manifest

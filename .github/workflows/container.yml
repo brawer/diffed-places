@@ -100,7 +100,7 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" | podman login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
 
       - name: Download artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
 
       - name: Pull architecture-specific images
         run: |
@@ -152,7 +152,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
 
       - name: Retrieve digests
         id: retrieve-digests

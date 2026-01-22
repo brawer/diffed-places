@@ -88,10 +88,21 @@ jobs:
           podman pull ${IMAGE}-amd64
           podman pull ${IMAGE}-arm64
 
+      - name: Print image variable for debugging
+        run: |
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          echo Image is ${IMAGE}
+
+      - name: Create manifest for debugging
+        run: |
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          podman manifest create ${IMAGE}-foo
+          podman manifest inspect ${IMAGE}-foo
+
       - name: Create and push manifest with sha tag
         run: |
           IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           podman manifest create ${IMAGE}
-          podman manifest add ${IMAGE} $(podman inspect ${IMAGE}-amd64 --format='{{.Digest}}')
-          podman manifest add ${IMAGE} $(podman inspect ${IMAGE}-arm64 --format='{{.Digest}}')
+          podman manifest add ${IMAGE} ${IMAGE}-amd64
+          podman manifest add ${IMAGE} ${IMAGE}-arm64
           podman manifest push ${IMAGE}

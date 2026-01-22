@@ -28,7 +28,7 @@ jobs:
       id-token: write
 
     steps:
-      - name: Checkout repository
+      - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Install Podman
@@ -50,23 +50,18 @@ jobs:
         id: build
         run: |
           IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }}
+          mkdir artifacts
           podman build \
             --platform ${{ matrix.platform }} \
             --build-arg BUILD_TIMESTAMP="${{ steps.commit.outputs.timestamp }}" \
             --build-arg VCS_REF="${{ github.sha }}" \
             --build-arg VCS_URL="${{ github.server_url }}/${{ github.repository }}" \
+            --digestfile=artifacts/digest.txt \
             --squash \
             -f ./Containerfile \
             -t $IMAGE \
             .
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
-
-      - name: Compute artifacts
-        run: |
-          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }}
-          mkdir artifacts
-          podman inspect ${IMAGE} --format='{{.Id}}' > artifacts/id.txt
-          podman inspect ${IMAGE} --format='{{.Digest}}' > artifacts/digest.txt
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
@@ -77,7 +72,11 @@ jobs:
 
       - name: Push image
         run: |
-          podman push ${{ steps.build.outputs.image }}
+          DIGEST=`cat artifacts/digest.txt`
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}
+          echo "Pushing ${IMAGE}
+          podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${ DIGEST }
+          # podman push ${{ steps.build.outputs.image }}
 
   merge:
     runs-on: ubuntu-24.04
@@ -97,16 +96,19 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | podman login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
 
-      - name: Download artifacts of previous build phases
+      - name: Download artifacts
         uses: actions/download-artifact@v6
 
       - name: Pull ARM image by digest for debugging
         run: |
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          AMD_DIGEST=`cat artifacts-${{ github.sha }}-amd64/digest.txt`
           ARM_DIGEST=`cat artifacts-${{ github.sha }}-arm64/digest.txt`
-          echo ARM digest is $ARM_DIGEST
-          ARM_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${ARM_DIGEST}
-          echo ARM image is $ARM_IMAGE
-          podman pull $ARM_IMAGE
+          ARM_IMAGE=${IMAGE}@${ARM_DIGEST}
+          echo Digest for AMD: ${AMD_DIGEST} for ARM: ${ARM_DIGEST}
+          echo Image for AMD: ${AMD_IMAGE} for ARM: ${ARM_IMAGE}
+          podman pull ${IMAGE}@${AMD_DIGEST}
+          podman pull ${IMAGE}@${ARM_DIGEST}
 
       - name: Pull architecture-specific containers
         run: |

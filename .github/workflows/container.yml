@@ -162,7 +162,6 @@ jobs:
 
       - name: Attest amd64 container
         uses: actions/attest-build-provenance@v3
-        id: attest
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.retrieve-digests.outputs.amd64_digest }}
@@ -170,7 +169,6 @@ jobs:
 
       - name: Attest arm64 container
         uses: actions/attest-build-provenance@v3
-        id: attest
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.retrieve-digests.outputs.arm64_digest }}
@@ -178,7 +176,6 @@ jobs:
 
       - name: Attest multi-arch commit-sha manifest
         uses: actions/attest-build-provenance@v3
-        id: attest
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ needs.merge.outputs.sha_digest }}
@@ -186,7 +183,6 @@ jobs:
 
       - name: Attest multi-arch latest manifest
         uses: actions/attest-build-provenance@v3
-        id: attest
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ needs.merge.outputs.latest_digest }}

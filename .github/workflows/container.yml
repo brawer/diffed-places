@@ -56,8 +56,6 @@ jobs:
             --build-arg BUILD_TIMESTAMP="${TIMESTAMP}" \
             --build-arg VCS_REF="${{ github.sha }}" \
             --build-arg VCS_URL="${{ github.server_url }}/${{ github.repository }}" \
-            --compression-format=zstd \
-            --compression-level=20 \
             --file ./Containerfile \
             --platform ${{ matrix.platform }} \
             --squash \

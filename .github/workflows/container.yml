@@ -12,6 +12,7 @@ env:
 jobs:
   build:
     runs-on: ${{ matrix.runner }}
+
     strategy:
       matrix:
         include:
@@ -24,8 +25,8 @@ jobs:
 
     permissions:
       contents: read
-      packages: write
       id-token: write
+      packages: write
 
     steps:
       - name: Check out repository
@@ -64,6 +65,7 @@ jobs:
             .
 
       - name: Push image
+        id: push
         run: |
           IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }}
           podman push ${IMAGE} \
@@ -76,10 +78,63 @@ jobs:
           path: artifacts
           retention-days: 3
 
-  # As per SLSA build level 3, this *must* run separately from the build.
-  attest-arch-containers:
+  merge:
     runs-on: ubuntu-24.04
     needs: [build]
+    permissions:
+      id-token: write
+      packages: write
+
+    outputs:
+      latest_digest: ${{ steps.manifests.outputs.latest_digest }}
+      sha_digest: ${{ steps.manifests.outputs.sha_digest }}
+
+    steps:
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install podman
+
+      - name: Log in to Container Registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v6
+
+      - name: Pull architecture-specific images
+        run: |
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          podman pull ${IMAGE}@`cat artifacts-amd64/digest.txt`
+          podman pull ${IMAGE}@`cat artifacts-arm64/digest.txt`
+
+      - name: Create and push manifests
+        id: manifests
+        run: |
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          IMAGE_AMD64=${IMAGE}@`cat artifacts-amd64/digest.txt`
+          IMAGE_ARM64=${IMAGE}@`cat artifacts-arm64/digest.txt`
+
+          IMAGE_SHA=${IMAGE}:${{ github.sha }}
+          podman manifest create ${IMAGE_SHA}
+          podman manifest add ${IMAGE_SHA} ${IMAGE_AMD64}
+          podman manifest add ${IMAGE_SHA} ${IMAGE_ARM64}
+          podman manifest push ${IMAGE_SHA} --digestfile=sha.digest
+          echo sha_digest=`cat sha.digest.txt` >> $GITHUB_OUTPUT
+
+          IMAGE_LATEST=${IMAGE}:latest
+          podman manifest create ${IMAGE_LATEST}
+          podman manifest add ${IMAGE_LATEST} ${IMAGE_AMD64}
+          podman manifest add ${IMAGE_LATEST} ${IMAGE_ARM64}
+          podman manifest push ${IMAGE_LATEST}
+          podman manifest push ${IMAGE_SHA} --digestfile=latest.digest
+          echo latest_digest=`cat sha.digest.txt` >> $GITHUB_OUTPUT
+
+
+  # As per SLSA level 3, attestation *must* run decoupled from build jobs.
+  attest:
+    runs-on: ubuntu-24.04
+    needs: [merge]
 
     permissions:
       attestations: write
@@ -102,58 +157,37 @@ jobs:
       - name: Retrieve digests
         id: retrieve-digests
         run: |
-          echo digest_amd64=`cat artifacts-amd64/digest.txt` >> $GITHUB_OUTPUT
-          echo digest_arm64=`cat artifacts-arm64/digest.txt` >> $GITHUB_OUTPUT
+          echo amd64_digest=`cat artifacts-amd64/digest.txt` >> $GITHUB_OUTPUT
+          echo arm64_digest=`cat artifacts-arm64/digest.txt` >> $GITHUB_OUTPUT
 
       - name: Attest amd64 container
         uses: actions/attest-build-provenance@v3
         id: attest
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.retrieve-digests.outputs.digest_amd64 }}
+          subject-digest: ${{ steps.retrieve-digests.outputs.amd64_digest }}
           push-to-registry: true
 
+      - name: Attest arm64 container
+        uses: actions/attest-build-provenance@v3
+        id: attest
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.retrieve-digests.outputs.arm64_digest }}
+          push-to-registry: true
 
-  merge:
-    runs-on: ubuntu-24.04
-    needs: [build, attest-arch-containers]
-    permissions:
-      packages: write
-      id-token: write
+      - name: Attest multi-arch commit-sha manifest
+        uses: actions/attest-build-provenance@v3
+        id: attest
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ needs.merge.outputs.sha_digest }}
+          push-to-registry: true
 
-    steps:
-      - name: Install Podman
-        run: |
-          sudo apt-get update
-          sudo apt-get -y install podman
-
-      - name: Log in to Container Registry
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v6
-
-      - name: Pull architecture-specific images
-        run: |
-          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          podman pull ${IMAGE}@`cat artifacts-amd64/digest.txt`
-          podman pull ${IMAGE}@`cat artifacts-arm64/digest.txt`
-
-      - name: Create and push manifests
-        run: |
-          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          IMAGE_AMD64=${IMAGE}@`cat artifacts-amd64/digest.txt`
-          IMAGE_ARM64=${IMAGE}@`cat artifacts-arm64/digest.txt`
-          IMAGE_LATEST=${IMAGE}:latest
-          IMAGE_SHA=${IMAGE}:${{ github.sha }}
-
-          podman manifest create ${IMAGE_SHA}
-          podman manifest add ${IMAGE_SHA} ${IMAGE_AMD64}
-          podman manifest add ${IMAGE_SHA} ${IMAGE_ARM64}
-          podman manifest push ${IMAGE_SHA}
-
-          podman manifest create ${IMAGE_LATEST}
-          podman manifest add ${IMAGE_LATEST} ${IMAGE_AMD64}
-          podman manifest add ${IMAGE_LATEST} ${IMAGE_ARM64}
-          podman manifest push ${IMAGE_LATEST}
+      - name: Attest multi-arch latest manifest
+        uses: actions/attest-build-provenance@v3
+        id: attest
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ needs.merge.outputs.latest_digest }}
+          push-to-registry: true

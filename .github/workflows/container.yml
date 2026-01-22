@@ -61,6 +61,20 @@ jobs:
             .
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
 
+      - name: Compute artifacts
+        run: |
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }}
+          mkdir artifacts
+          podman inspect ${IMAGE} --format='{{.Id}}' > artifacts/id.txt
+          podman inspect ${IMAGE} --format='{{.Digest}}' > artifacts/digest.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: artifacts-${{ github.sha }}-${{ matrix.arch }}
+          path: artifacts
+          retention-days: 1
+
       - name: Push image
         run: |
           podman push ${{ steps.build.outputs.image }}
@@ -83,22 +97,22 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | podman login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
 
+      - name: Download artifacts of previous build phases
+        uses: actions/download-artifact@v6
+
+      - name: List directory contents for debugging
+        run: |
+          ls -l
+
+      - name: List ARM artifacts for debugging
+        run: |
+          ls -l artifacts-${{ github.sha }}-arm64
+
       - name: Pull architecture-specific containers
         run: |
           IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           podman pull ${IMAGE}-amd64
           podman pull ${IMAGE}-arm64
-
-      - name: Print image variable for debugging
-        run: |
-          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          echo Image is ${IMAGE}
-
-      - name: Create manifest for debugging
-        run: |
-          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          podman manifest create ${IMAGE}-foo
-          podman manifest inspect ${IMAGE}-foo
 
       - name: Create and push manifest with sha tag
         run: |

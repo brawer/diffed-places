@@ -72,16 +72,15 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: artifacts-${{ github.sha }}-${{ matrix.arch }}
+          name: artifacts-${{ matrix.arch }}
           path: artifacts
-          retention-days: 1
+          retention-days: 3
 
 
   merge:
     runs-on: ubuntu-24.04
     needs: [build]
     permissions:
-      # contents: read
       packages: write
       id-token: write
 
@@ -98,38 +97,26 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v6
 
-      - name: Pull ARM image by digest for debugging
+      - name: Pull architecture-specific images
         run: |
           IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          AMD_DIGEST=`cat artifacts-${{ github.sha }}-amd64/digest.txt`
-          ARM_DIGEST=`cat artifacts-${{ github.sha }}-arm64/digest.txt`
-          ARM_IMAGE=${IMAGE}@${ARM_DIGEST}
-          echo Digest for AMD: ${AMD_DIGEST} for ARM: ${ARM_DIGEST}
-          echo Image for AMD: ${AMD_IMAGE} for ARM: ${ARM_IMAGE}
-          podman pull ${IMAGE}@${AMD_DIGEST}
-          podman pull ${IMAGE}@${ARM_DIGEST}
-
-      - name: Pull architecture-specific containers
-        run: |
-          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          podman pull ${IMAGE}-amd64
-          podman pull ${IMAGE}-arm64
+          podman pull ${IMAGE}@`cat artifacts-amd64/digest.txt`
+          podman pull ${IMAGE}@`cat artifacts-arm64/digest.txt`
 
       - name: Create and push manifests
         run: |
           IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          IMAGE_SHA=${IMAGE}:${{ github.sha }}
+          IMAGE_AMD64=${IMAGE}@`cat artifacts-amd64/digest.txt`
+          IMAGE_ARM64=${IMAGE}@`cat artifacts-arm64/digest.txt`
           IMAGE_LATEST=${IMAGE}:latest
-
-          AMD_DIGEST=`cat artifacts-${{ github.sha }}-amd64/digest.txt`
-          ARM_DIGEST=`cat artifacts-${{ github.sha }}-arm64/digest.txt`
+          IMAGE_SHA=${IMAGE}:${{ github.sha }}
 
           podman manifest create ${IMAGE_SHA}
-          podman manifest add ${IMAGE_SHA} ${IMAGE_SHA}-amd64
-          podman manifest add ${IMAGE_SHA} ${IMAGE_SHA}-arm64
+          podman manifest add ${IMAGE_SHA} ${IMAGE_AMD64}
+          podman manifest add ${IMAGE_SHA} ${IMAGE_ARM64}
           podman manifest push ${IMAGE_SHA}
 
           podman manifest create ${IMAGE_LATEST}
-          podman manifest ${IMAGE_LATEST} ${IMAGE_SHA}-amd64
-          podman manifest ${IMAGE_LATEST} ${IMAGE_SHA}-arm64
-          podman manifest push ${IMAGE}:latest
+          podman manifest add ${IMAGE_LATEST} ${IMAGE_AMD64}
+          podman manifest add ${IMAGE_LATEST} ${IMAGE_ARM64}
+          podman manifest push ${IMAGE_LATEST}

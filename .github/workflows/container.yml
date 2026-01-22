@@ -58,30 +58,21 @@ jobs:
             -f ./Containerfile \
             -t $IMAGE \
             .
-          DIGEST=$(podman inspect $IMAGE --format='{{.Digest}}')
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
-          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
 
       - name: Push image
         run: |
           podman push ${{ steps.build.outputs.image }}
 
   merge:
-    runs-on: ubuntu-latest
-    needs: build
+    runs-on: ubuntu-24.04
+    needs: [build]
     permissions:
-      contents: read
+      # contents: read
       packages: write
       id-token: write
 
     steps:
-      - name: Download digests
-        uses: actions/download-artifact@v4
-        with:
-          pattern: digests-*
-          merge-multiple: true
-          path: /tmp/digests
-
       - name: Install Podman
         run: |
           sudo apt-get update
@@ -91,32 +82,16 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | podman login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
 
-      - name: Create and push manifest
-        id: manifest
+      - name: Pull architecture-specific containers
         run: |
-          # Read digests
-          AMD64_DIGEST=$(cat /tmp/digests/amd64.txt)
-          ARM64_DIGEST=$(cat /tmp/digests/arm64.txt)
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          podman pull ${IMAGE}-amd64
+          podman pull ${IMAGE}-arm64
 
-          # Create manifest list with sha tag
-          podman manifest create ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          podman manifest add ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} $AMD64_DIGEST
-          podman manifest add ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} $ARM64_DIGEST
-          podman manifest push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-
-          # Create manifest list with main tag
-          podman manifest create ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main
-          podman manifest add ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main $AMD64_DIGEST
-          podman manifest add ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main $ARM64_DIGEST
-          podman manifest push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main
-
-          # Create manifest list with latest tag
-          podman manifest create ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          podman manifest add ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest $AMD64_DIGEST
-          podman manifest add ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest $ARM64_DIGEST
-          podman manifest push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-
-          # Get the manifest digest
-          FULL_DIGEST=$(podman inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} --format='{{.Digest}}')
-          echo "digest=$FULL_DIGEST" >> $GITHUB_OUTPUT
-          echo "Manifest Digest: $FULL_DIGEST"
+      - name: Create and push manifest with sha tag
+        run: |
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          podman manifest create ${IMAGE}
+          podman manifest add ${IMAGE} $(podman inspect ${IMAGE}-amd64 --format='{{.Digest}}')
+          podman manifest add ${IMAGE} $(podman inspect ${IMAGE}-arm64 --format='{{.Digest}}')
+          podman manifest push ${IMAGE}

@@ -76,10 +76,47 @@ jobs:
           path: artifacts
           retention-days: 3
 
+  # As per SLSA build level 3, this *must* run separately from the build.
+  attest-arch-containers:
+    runs-on: ubuntu-24.04
+    needs: [build]
+
+    permissions:
+      attestations: write
+      id-token: write
+      packages: write
+
+    steps:
+      - name: Login to Container Registry
+        # actions/attest-build-provenance@v3 (below) needs docker,
+        # it does not seem to work with podman.
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v6
+
+      - name: Retrieve digests
+        id: retrieve-digests
+        run: |
+          echo digest_amd64=`cat artifacts-amd64/digest.txt` >> $GITHUB_OUTPUT
+          echo digest_arm64=`cat artifacts-arm64/digest.txt` >> $GITHUB_OUTPUT
+
+      - name: Attest amd64 container
+        uses: actions/attest-build-provenance@v3
+        id: attest
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.retrieve-digests.outputs.digest_amd64 }}
+          push-to-registry: true
+
 
   merge:
     runs-on: ubuntu-24.04
-    needs: [build]
+    needs: [build, attest-arch-containers]
     permissions:
       packages: write
       id-token: write

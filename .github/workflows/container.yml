@@ -53,7 +53,7 @@ jobs:
           TIMESTAMP=${{ steps.commit-info.outputs.timestamp }}
           mkdir artifacts
           podman build \
-            --build-arg BUILD_TIMESTAMP="${ TIMESTAMP }" \
+            --build-arg BUILD_TIMESTAMP="${TIMESTAMP}" \
             --build-arg VCS_REF="${{ github.sha }}" \
             --build-arg VCS_URL="${{ github.server_url }}/${{ github.repository }}" \
             --compression-format=zstd \
@@ -61,14 +61,14 @@ jobs:
             --file ./Containerfile \
             --platform ${{ matrix.platform }} \
             --squash \
-            --tag ${ IMAGE } \
-            --timestamp $(date -d "${ TIMESTAMP }" +%s) \
+            --tag ${IMAGE} \
+            --timestamp $(date -d "${TIMESTAMP}" +%s) \
             .
 
       - name: Push image
         run: |
           IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }}
-          podman push ${ IMAGE } \
+          podman push ${IMAGE} \
             --digestfile artifacts/digest.txt
 
       - name: Upload artifacts

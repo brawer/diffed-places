@@ -1,4 +1,4 @@
-name: Build and Push Container
+name: Build container
 
 on:
   push:
@@ -71,7 +71,7 @@ jobs:
           podman push ${IMAGE} \
             --digestfile artifacts/digest.txt
 
-      - name: Upload artifacts
+      - name: Upload image digests to artifacts
         uses: actions/upload-artifact@v6
         with:
           name: artifacts-${{ matrix.arch }}
@@ -84,10 +84,6 @@ jobs:
     permissions:
       id-token: write
       packages: write
-
-    outputs:
-      latest_digest: ${{ steps.manifests.outputs.latest_digest }}
-      sha_digest: ${{ steps.manifests.outputs.sha_digest }}
 
     steps:
       - name: Install Podman
@@ -108,30 +104,35 @@ jobs:
           podman pull ${IMAGE}@`cat artifacts-amd64/digest.txt`
           podman pull ${IMAGE}@`cat artifacts-arm64/digest.txt`
 
-      - name: Create and push manifests
+      - name: Create and push multi-architecture manifest
         id: manifests
         run: |
           IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           IMAGE_AMD64=${IMAGE}@`cat artifacts-amd64/digest.txt`
           IMAGE_ARM64=${IMAGE}@`cat artifacts-arm64/digest.txt`
 
+          mkdir artifacts
+
           IMAGE_SHA=${IMAGE}:${{ github.sha }}
           podman manifest create ${IMAGE_SHA}
           podman manifest add ${IMAGE_SHA} ${IMAGE_AMD64}
           podman manifest add ${IMAGE_SHA} ${IMAGE_ARM64}
-          podman manifest push ${IMAGE_SHA} --digestfile=sha.digest
-          echo sha_digest=`cat sha.digest.txt` >> $GITHUB_OUTPUT
+          podman tag ${IMAGE_SHA} ${IMAGE}:latest
+          podman manifest push ${IMAGE_SHA} \
+              --all \
+              --digestfile artifacts/digest.txt
 
-          IMAGE_LATEST=${IMAGE}:latest
-          podman manifest create ${IMAGE_LATEST}
-          podman manifest add ${IMAGE_LATEST} ${IMAGE_AMD64}
-          podman manifest add ${IMAGE_LATEST} ${IMAGE_ARM64}
-          podman manifest push ${IMAGE_LATEST}
-          podman manifest push ${IMAGE_SHA} --digestfile=latest.digest
-          echo latest_digest=`cat sha.digest.txt` >> $GITHUB_OUTPUT
+      - name: Upload manifest digest to artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: artifacts-manifest
+          path: artifacts
+          retention-days: 3
 
 
-  # As per SLSA level 3, attestation *must* run decoupled from build jobs.
+  # If you ever refactor the GitHub workflow, make sure that the attest phase
+  # continues to run on a separate machine, decoupled from any build jobs.
+  # https://slsa.dev/spec/v1.2/build-track-basics#build-l3
   attest:
     runs-on: ubuntu-24.04
     needs: [merge]
@@ -143,8 +144,6 @@ jobs:
 
     steps:
       - name: Login to Container Registry
-        # actions/attest-build-provenance@v3 (below) needs docker,
-        # it does not seem to work with podman.
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -159,6 +158,7 @@ jobs:
         run: |
           echo amd64_digest=`cat artifacts-amd64/digest.txt` >> $GITHUB_OUTPUT
           echo arm64_digest=`cat artifacts-arm64/digest.txt` >> $GITHUB_OUTPUT
+          echo manifest_digest=`cat artifacts-manifest/digest.txt` >> $GITHUB_OUTPUT
 
       - name: Attest amd64 container
         uses: actions/attest-build-provenance@v3
@@ -174,16 +174,9 @@ jobs:
           subject-digest: ${{ steps.retrieve-digests.outputs.arm64_digest }}
           push-to-registry: true
 
-      - name: Attest multi-arch commit-sha manifest
+      - name: Attest manifest
         uses: actions/attest-build-provenance@v3
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ needs.merge.outputs.sha_digest }}
-          push-to-registry: true
-
-      - name: Attest multi-arch latest manifest
-        uses: actions/attest-build-provenance@v3
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ needs.merge.outputs.latest_digest }}
+          subject-digest: ${{ steps.retrieve-digests.outputs.manifest_digest }}
           push-to-registry: true

@@ -9,6 +9,8 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+permissions: {}
+
 jobs:
   build:
     name: Build architecture-specific images

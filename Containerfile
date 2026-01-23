@@ -48,7 +48,8 @@ ENTRYPOINT ["/app/diffed-places"]
 
 LABEL  \
     org.opencontainers.image.authors="Sascha Brawer <sascha@brawer.ch>"  \
-    org.opencontainers.image.created=$BUILD_TIMESTAMP \
+    org.opencontainers.image.created=$BUILD_TIMESTAMP  \
+    org.opencontainers.image.description="Data pipeline for Diffed Places"  \
     org.opencontainers.image.licenses="MIT"  \
     org.opencontainers.image.revision=$VCS_REF  \
     org.opencontainers.image.sbom="/sbom/sbom.cdx.json"  \

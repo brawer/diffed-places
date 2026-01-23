@@ -1,4 +1,4 @@
-name: Build container
+name: Container Build
 
 on:
   push:
@@ -11,6 +11,7 @@ env:
 
 jobs:
   build:
+    name: Build architecture-specific images
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -78,7 +79,8 @@ jobs:
           path: artifacts
           retention-days: 3
 
-  merge:
+  manifest:
+    name: Build multi-architecture manifest
     runs-on: ubuntu-24.04
     needs: [build]
     permissions:
@@ -134,8 +136,9 @@ jobs:
   # continues to run on a separate machine, decoupled from any build jobs.
   # https://slsa.dev/spec/v1.2/build-track-basics#build-l3
   attest:
+    name: Attest build provenance
     runs-on: ubuntu-24.04
-    needs: [merge]
+    needs: [manifest]
 
     permissions:
       attestations: write

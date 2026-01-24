@@ -53,7 +53,7 @@ jobs:
       - name: Build image
         id: build
         run: |
-          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }}
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-${{ matrix.arch }}
           TIMESTAMP=${{ steps.commit-info.outputs.timestamp }}
           mkdir artifacts
           podman build \
@@ -70,7 +70,7 @@ jobs:
       - name: Push image
         id: push
         run: |
-          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }}
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-${{ matrix.arch }}
           podman push ${IMAGE} \
             --digestfile artifacts/digest.txt
 
@@ -122,8 +122,7 @@ jobs:
           podman manifest add ${IMAGE_SHA} ${IMAGE_AMD64}
           podman manifest add ${IMAGE_SHA} ${IMAGE_ARM64}
           podman tag ${IMAGE_SHA} ${IMAGE}:latest
-          podman manifest push ${IMAGE_SHA} \
-              --all \
+          podman manifest push ${IMAGE}:latest \
               --digestfile artifacts/digest.txt
 
       - name: Upload manifest digest to artifacts

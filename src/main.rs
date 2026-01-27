@@ -5,10 +5,11 @@ use clap::{Parser, Subcommand};
 
 mod coverage;
 mod import_atp;
+mod import_osm;
 mod place;
 
 use crate::coverage::build_coverage;
-use crate::import_atp::import_atp;
+use crate::{import_atp::import_atp, import_osm::import_osm};
 
 #[derive(Parser)]
 #[command(name = "diffed-places")]
@@ -33,6 +34,16 @@ enum Commands {
         #[arg(short, long, value_name = "coverage")]
         output: PathBuf,
     },
+    ImportOsm {
+        #[arg(long, value_name = "openstreetmap.pbf")]
+        osm: PathBuf,
+
+        #[arg(long, value_name = "coverage")]
+        coverage: PathBuf,
+
+        #[arg(short, long, value_name = "openstreetmap.parquet")]
+        output: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -40,6 +51,11 @@ fn main() -> Result<()> {
     match &args.command {
         Some(Commands::ImportAtp { input, output }) => import_atp(input, output),
         Some(Commands::BuildCoverage { places, output }) => build_coverage(places, output),
+        Some(Commands::ImportOsm {
+            osm,
+            coverage,
+            output,
+        }) => import_osm(osm, coverage, output),
         None => Err(anyhow!("no subcommand given")),
     }
 }

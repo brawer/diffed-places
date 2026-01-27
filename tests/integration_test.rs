@@ -31,6 +31,20 @@ fn test_pipeline() -> Result<()> {
         .assert()
         .success();
 
+    let mut zugerland_osm_pbf = test_data.clone();
+    zugerland_osm_pbf.push("zugerland.osm.pbf");
+    let osm_parquet = NamedTempFile::new()?;
+    Command::new(cargo_bin!("diffed-places"))
+        .arg("import-osm")
+        .arg("--osm")
+        .arg(&zugerland_osm_pbf)
+        .arg("--coverage")
+        .arg(coverage.path())
+        .arg("--output")
+        .arg(osm_parquet.path())
+        .assert()
+        .success();
+
     Ok(())
 }
 
@@ -71,5 +85,48 @@ fn test_build_coverage_bad_input_path() -> Result<()> {
         .failure()
         .stderr(predicates::str::contains("could not open file"))
         .stderr(predicates::str::contains("test/file/does-not-exist"));
+    Ok(())
+}
+
+#[test]
+fn test_import_osm_bad_input_path() -> Result<()> {
+    let mut test_data = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    test_data.push("tests/test_data");
+    let mut osm = test_data.clone();
+    osm.push("zugerland.osm.pbf");
+    let mut coverage = test_data.clone();
+    coverage.push("alltheplaces.coverage");
+    let output = NamedTempFile::new()?;
+
+    // OpenStreetMap file does not exist.
+    Command::new(cargo_bin!("diffed-places"))
+        .arg("import-osm")
+        .arg("--osm")
+        .arg("test/file/does-not-exist")
+        .arg("--coverage")
+        .arg(&coverage)
+        .arg("--output")
+        .arg(output.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("could not open file"))
+        .stderr(predicates::str::contains("test/file/does-not-exist"));
+
+    // Coverage file does not exist.
+    Command::new(cargo_bin!("diffed-places"))
+        .arg("import-osm")
+        .arg("--osm")
+        .arg(&osm)
+        .arg("--coverage")
+        .arg("test/coverage-file/does-not-exist")
+        .arg("--output")
+        .arg(output.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("could not open coverage file"))
+        .stderr(predicates::str::contains(
+            "test/coverage-file/does-not-exist",
+        ));
+
     Ok(())
 }

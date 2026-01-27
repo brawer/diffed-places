@@ -1,0 +1,21 @@
+name: Container Cleanup
+
+on:
+  schedule:
+    - cron: '42 16 * * 2'  # every Tuesday at 16:42 UTC
+
+permissions: {}
+
+jobs:
+  cleanup:
+    name: Clean up GitHub Container Registry
+    permissions:
+      packages: write
+    steps:
+      - name: Delete untagged container images
+        uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55  # v5.0.0
+        with: 
+          package-name: 'pipeline'
+          package-type: 'container'
+          min-versions-to-keep: 5
+          delete-only-untagged-versions: 'true'

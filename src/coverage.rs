@@ -232,7 +232,10 @@ mod writer {
     }
 
     fn read_places(places: &Path, covering: SyncSender<CellID>) -> Result<()> {
-        let reader = SerializedFileReader::new(File::open(places)?)?;
+        use anyhow::Context;
+        let file =
+            File::open(places).with_context(|| format!("could not open file `{:?}`", places))?;
+        let reader = SerializedFileReader::new(file)?;
         let metadata = reader.metadata();
         let schema = metadata.file_metadata().schema();
         let s2_cell_id_column = column_index("s2_cell_id", schema)?;

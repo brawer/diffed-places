@@ -479,11 +479,11 @@ mod writer {
         }
 
         #[test]
-        fn test_build_coverage() {
+        fn test_build_coverage() -> Result<()> {
             let mut atp = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             atp.push("tests/test_data/alltheplaces.parquet");
-            let spatial_cov = PathBuf::from("test_build_coverage.spatial-coverage");
-            build_coverage(&atp, &spatial_cov).unwrap();
+            let spatial_cov = NamedTempFile::new()?;
+            build_coverage(&atp, spatial_cov.path())
         }
 
         #[test]

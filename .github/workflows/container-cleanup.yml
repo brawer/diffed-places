@@ -9,6 +9,7 @@ permissions: {}
 jobs:
   cleanup:
     name: Clean up GitHub Container Registry
+    runs-on: ubuntu-latest
     permissions:
       packages: write
     steps:

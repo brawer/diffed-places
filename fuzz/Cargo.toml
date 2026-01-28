@@ -1,0 +1,20 @@
+[package]
+name = "diffed-places-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+diffed-places = { path = ".." }
+libfuzzer-sys = "0.4"
+
+
+[[bin]]
+name = "fuzz_import_atp"
+path = "fuzz_targets/fuzz_import_atp.rs"
+test = false
+doc = false
+bench = false

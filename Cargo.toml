@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 arrow = { version = "57.2.0", default-features = false }
-clap = { version = "4.5.55", default-features = false, features = ["derive", "std"] }
+clap = { version = "4.5.56", default-features = false, features = ["derive", "std"] }
 deepsize = "0.2.0"
 deepsize_derive = "0.1.2"
 ext-sort = { version = "0.1.5", features = ["memory-limit"] }

@@ -165,21 +165,21 @@ jobs:
           echo manifest_digest=`cat artifacts-manifest/digest.txt` >> $GITHUB_OUTPUT
 
       - name: Attest amd64 container
-        uses: actions/attest-build-provenance@00014ed6ed5efc5b1ab7f7f34a39eb55d41aa4f8  #v3.1.0
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f  #v3.2.0
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.retrieve-digests.outputs.amd64_digest }}
           push-to-registry: true
 
       - name: Attest arm64 container
-        uses: actions/attest-build-provenance@00014ed6ed5efc5b1ab7f7f34a39eb55d41aa4f8  #v3.1.0
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f  #v3.2.0
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.retrieve-digests.outputs.arm64_digest }}
           push-to-registry: true
 
       - name: Attest manifest
-        uses: actions/attest-build-provenance@00014ed6ed5efc5b1ab7f7f34a39eb55d41aa4f8  #v3.1.0
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f  #v3.2.0
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.retrieve-digests.outputs.manifest_digest }}

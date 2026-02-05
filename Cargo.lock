@@ -579,6 +579,7 @@ dependencies = [
  "parquet",
  "piz",
  "predicates",
+ "protobuf_iter",
  "rayon",
  "regex",
  "s2",
@@ -1312,6 +1313,12 @@ checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "protobuf_iter"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd97a2e5d78e0dcb240ef1e192e7e29a1f29070bd71d182a5ed55b6ac055f19e"
 
 [[package]]
 name = "quote"

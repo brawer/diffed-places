@@ -28,16 +28,17 @@ pub fn import_osm(pbf: &Path, coverage: &Path, _output: &Path) -> Result<()> {
     // Pass 1: Determine which nodes are located in our coverage area.
     let num_workers = usize::from(thread::available_parallelism()?);
     thread::scope(|s| {
-        let (tx, rx) = sync_channel::<Vec<u8>>(num_workers);
+        let (tx, rx) = sync_channel::<Blob>(num_workers);
         let producer = s.spawn(move || {
-            for blob in 0..nodes_end {
-                let data = reader.read_blob(blob)?;
-                tx.send(data)?;
+            for i in 0..nodes_end {
+                let blob = reader.read_blob(i)?;
+                tx.send(blob)?;
             }
             Ok(())
         });
-        rx.into_iter().par_bridge().try_for_each(|_data| {
-            // println!("consumer: {:?} bytes", _data.len());
+        rx.into_iter().par_bridge().try_for_each(|blob| {
+            let data = blob.into_data(); // decompress
+            let _block = PrimitiveBlock::parse(&data);
             Ok(())
         })?;
         producer.join().expect("panic in producer thread")
@@ -86,7 +87,7 @@ impl<'a, R: Read + Seek> BlobReader<'a, R> {
         self.blobs.len()
     }
 
-    pub fn read_blob(&mut self, blob: usize) -> Result<Vec<u8>> {
+    pub fn read_blob(&mut self, blob: usize) -> Result<Blob> {
         let (offset, len) = self.blobs[blob];
         let mut buf = Vec::with_capacity(len);
         self.reader.seek(SeekFrom::Start(offset))?;
@@ -97,7 +98,15 @@ impl<'a, R: Read + Seek> BlobReader<'a, R> {
             self.reader.read_exact(&mut buf)?;
         }
 
-        Ok(buf)
+        for m in MessageIter::new(&buf) {
+            match m.tag {
+                1 => return Ok(Blob::Raw(Vec::from(m.value.get_data()))),
+                3 => return Ok(Blob::Zlib(Vec::from(m.value.get_data()))),
+                _ => {}
+            }
+        }
+
+        Err(anyhow!("cannot decode blob {:?}", blob))
     }
 
     /// Partitions the blogs into nodes, ways and relations.
@@ -121,7 +130,7 @@ impl<'a, R: Read + Seek> BlobReader<'a, R> {
             while left < right {
                 let mid = left + (right - left) / 2;
                 let blob = self.read_blob(mid)?;
-                if Self::classify(&blob)? < 2 {
+                if Self::classify(blob)? < 2 {
                     left = mid + 1;
                 } else {
                     right = mid;
@@ -136,7 +145,7 @@ impl<'a, R: Read + Seek> BlobReader<'a, R> {
             while left < right {
                 let mid = left + (right - left) / 2;
                 let blob = self.read_blob(mid)?;
-                if Self::classify(&blob)? < 3 {
+                if Self::classify(blob)? < 3 {
                     left = mid + 1;
                 } else {
                     right = mid;
@@ -149,25 +158,15 @@ impl<'a, R: Read + Seek> BlobReader<'a, R> {
     }
 
     /// Internal helper for partition().
-    fn classify(blob: &[u8]) -> Result<u8> {
-        for m in MessageIter::new(blob) {
-            let block = match m.tag {
-                1 => Some(Blob::Raw(Vec::from(m.value.get_data()))),
-                3 => Some(Blob::Zlib(Vec::from(m.value.get_data()))),
-                _ => None,
-            };
-            if let Some(block) = block {
-                let data = block.into_data();
-                let block = PrimitiveBlock::parse(&data);
-                return match block.primitives().next() {
-                    Some(Primitive::Node(_)) => Ok(1),
-                    Some(Primitive::Way(_)) => Ok(2),
-                    Some(Primitive::Relation(_)) => Ok(3),
-                    None => Err(anyhow!("empty blob")),
-                };
-            };
+    fn classify(blob: Blob) -> Result<u8> {
+        let data = blob.into_data();
+        let block = PrimitiveBlock::parse(&data);
+        match block.primitives().next() {
+            Some(Primitive::Node(_)) => Ok(1),
+            Some(Primitive::Way(_)) => Ok(2),
+            Some(Primitive::Relation(_)) => Ok(3),
+            None => Err(anyhow!("empty blob")),
         }
-        Err(anyhow!("unknown blob content"))
     }
 
     fn read_blob_header<T: Read>(reader: &mut T) -> Result<Vec<u8>> {
@@ -208,16 +207,11 @@ mod tests {
         assert_eq!(reader.blobs, &[(119, 16681), (16816, 15278), (32110, 8616)]);
         assert_eq!(reader.num_blobs(), 3);
         assert_eq!(reader.partition()?, (1, 2));
-        let blob = reader.read_blob(2)?;
-        assert_eq!(blob.len(), 8616);
-        assert_eq!(blob[1234], 121);
+        if let Blob::Zlib(_) = reader.read_blob(2)? {
+        } else {
+            return Err(anyhow!("failed to read blob"));
+        }
         Ok(())
-    }
-
-    #[test]
-    fn test_blob_reader_classify_err() {
-        assert!(BlobReader::<File>::classify(b"").is_err());
-        assert!(BlobReader::<File>::classify(&[8]).is_err());
     }
 
     #[test]

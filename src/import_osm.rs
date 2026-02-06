@@ -1,9 +1,12 @@
 use anyhow::{Context, Ok, Result, anyhow};
 use osm_pbf_iter::{Blob, Primitive, PrimitiveBlock};
 use protobuf_iter::MessageIter;
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::mpsc::sync_channel;
+use std::thread;
 
 use crate::coverage::Coverage;
 
@@ -11,19 +14,34 @@ pub fn import_osm(pbf: &Path, coverage: &Path, _output: &Path) -> Result<()> {
     let pbf_error = || format!("could not open file `{:?}`", pbf);
     let mut file = File::open(pbf).with_context(pbf_error)?;
     let mut reader = BlobReader::try_new(&mut file).with_context(pbf_error)?;
+
+    // Partition the PBF file into blobs with nodes, ways and relations.
+    // Ranges may overlap by one blob, see BlobReader::partition().
+    let (nodes_end, ways_end) = reader.partition()?;
+    let _ways_start = nodes_end.saturating_sub(1);
+    let _rels_start = ways_end.saturating_sub(1);
+    let _rels_end = reader.num_blobs();
+
     let _coverage = Coverage::load(coverage)
         .with_context(|| format!("could not open coverage file `{:?}`", coverage))?;
 
-    let (ways_start, relations_start) = reader.partition()?;
-    println!(
-        "ways_start={:?} relations_start={:?}",
-        ways_start, relations_start
-    );
-
-    // TODO: Use a thread pool for decompression and decoding.
-    if reader.num_blobs() > 0 {
-        _ = reader.read_blob(0);
-    }
+    // Pass 1: Determine which nodes are located in our coverage area.
+    let num_workers = usize::from(thread::available_parallelism()?);
+    thread::scope(|s| {
+        let (tx, rx) = sync_channel::<Vec<u8>>(num_workers);
+        let producer = s.spawn(move || {
+            for blob in 0..nodes_end {
+                let data = reader.read_blob(blob)?;
+                tx.send(data)?;
+            }
+            Ok(())
+        });
+        rx.into_iter().par_bridge().try_for_each(|_data| {
+            // println!("consumer: {:?} bytes", _data.len());
+            Ok(())
+        })?;
+        producer.join().expect("panic in producer thread")
+    })?;
 
     Ok(())
 }
@@ -82,7 +100,20 @@ impl<'a, R: Read + Seek> BlobReader<'a, R> {
         Ok(buf)
     }
 
-    /// Finds the first blob with ways, and the first blob with relations.
+    /// Partitions the blogs into nodes, ways and relations.
+    ///
+    /// # Returns
+    ///
+    /// A tuple `(a, b)` where `a` is the first blob without any nodes,
+    /// and `b` is the first blob without either nodes or ways.
+    ///
+    /// # Warnings
+    ///
+    /// In the
+    /// [OpenStreetMap PBF format](https://wiki.openstreetmap.org/wiki/PBF_Format),
+    /// a single blog may contain repeated PrimitiveGroups. While all primitives
+    /// in the same must be of the same type (node, way or relation), the format
+    /// makes no such guarantee on the blob level.
     pub fn partition(&mut self) -> Result<(usize, usize)> {
         let ways = {
             let mut left = 0;

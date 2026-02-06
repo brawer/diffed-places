@@ -8,24 +8,29 @@ use crate::coverage::Coverage;
 
 pub fn import_osm(pbf: &Path, coverage: &Path, _output: &Path) -> Result<()> {
     let pbf_error = || format!("could not open file `{:?}`", pbf);
-    let mut pbf_file = File::open(pbf).with_context(pbf_error)?;
-    let _index = BlobIndex::try_new(&mut pbf_file).with_context(pbf_error)?;
+    let mut file = File::open(pbf).with_context(pbf_error)?;
+    let mut reader = BlobReader::try_new(&mut file).with_context(pbf_error)?;
     let _coverage = Coverage::load(coverage)
         .with_context(|| format!("could not open coverage file `{:?}`", coverage))?;
+
+    // TODO: Use a thread pool for decompression and decoding.
+    if reader.num_blobs() > 0 {
+        _ = reader.read_blob(0);
+    }
+
     Ok(())
 }
 
-/// Keeps an index of blobs within an OpenStreetMap PBF file.
-struct BlobIndex {
+/// Reads data blobs from OpenStreetMap PBF files.
+struct BlobReader<'a, R: Read + Seek> {
+    reader: &'a mut R,
+
     /// Offset and size of each data blob.
-    _blobs: Vec<(u64, usize)>,
+    blobs: Vec<(u64, usize)>,
 }
 
-impl BlobIndex {
-    pub fn try_new<R>(reader: &mut R) -> Result<BlobIndex>
-    where
-        R: Read + Seek,
-    {
+impl<'a, R: Read + Seek> BlobReader<'a, R> {
+    pub fn try_new(reader: &'a mut R) -> Result<BlobReader<'a, R>> {
         reader.seek(SeekFrom::End(0))?;
         let file_size = reader.stream_position()?;
         if file_size == 0 {
@@ -48,10 +53,29 @@ impl BlobIndex {
             }
             pos += 4_u64 + (blob_header.len() as u64) + (data_size as u64);
         }
-        Ok(BlobIndex { _blobs: blobs })
+
+        Ok(BlobReader { reader, blobs })
     }
 
-    fn read_blob_header<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
+    pub fn num_blobs(&self) -> usize {
+        self.blobs.len()
+    }
+
+    pub fn read_blob(&mut self, blob: usize) -> Result<Vec<u8>> {
+        let (offset, len) = self.blobs[blob];
+        let mut buf = Vec::with_capacity(len);
+        self.reader.seek(SeekFrom::Start(offset))?;
+
+        // SAFETY: After read_exact(), all bytes in buffer have a defined value.
+        unsafe {
+            buf.set_len(len);
+            self.reader.read_exact(&mut buf)?;
+        }
+
+        Ok(buf)
+    }
+
+    fn read_blob_header<T: Read>(reader: &mut T) -> Result<Vec<u8>> {
         let header_len = {
             let mut header_len_buf = [0; 4];
             reader.read_exact(&mut header_len_buf)?;
@@ -83,19 +107,23 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn test_blob_index() -> Result<()> {
+    fn test_blob_reader() -> Result<()> {
         let mut file = File::open(test_data_path("zugerland.osm.pbf"))?;
-        let index = BlobIndex::try_new(&mut file)?;
-        assert_eq!(index._blobs, &[(119, 16681), (16816, 15278), (32110, 8616)]);
+        let mut reader = BlobReader::try_new(&mut file)?;
+        assert_eq!(reader.blobs, &[(119, 16681), (16816, 15278), (32110, 8616)]);
+        assert_eq!(reader.num_blobs(), 3);
+        let blob = reader.read_blob(2)?;
+        assert_eq!(blob.len(), 8616);
+        assert_eq!(blob[1234], 121);
         Ok(())
     }
 
     #[test]
     fn test_blob_index_bad_data() {
-        assert!(BlobIndex::try_new(&mut Cursor::new(b"")).is_err());
-        assert!(BlobIndex::try_new(&mut Cursor::new(b"\0\0\0")).is_err());
-        assert!(BlobIndex::try_new(&mut Cursor::new(b"\0\0\0\0")).is_err());
-        assert!(BlobIndex::try_new(&mut Cursor::new(b"test file with junk data")).is_err());
+        assert!(BlobReader::try_new(&mut Cursor::new(b"")).is_err());
+        assert!(BlobReader::try_new(&mut Cursor::new(b"\0\0\0")).is_err());
+        assert!(BlobReader::try_new(&mut Cursor::new(b"\0\0\0\0")).is_err());
+        assert!(BlobReader::try_new(&mut Cursor::new(b"test file with junk data")).is_err());
     }
 
     fn test_data_path(filename: &str) -> PathBuf {

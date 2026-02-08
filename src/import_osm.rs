@@ -2,6 +2,7 @@ use anyhow::{Context, Ok, Result, anyhow};
 use osm_pbf_iter::{Blob, Primitive, PrimitiveBlock};
 use protobuf_iter::MessageIter;
 use rayon::prelude::*;
+use s2;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -22,26 +23,55 @@ pub fn import_osm(pbf: &Path, coverage: &Path, _output: &Path) -> Result<()> {
     let _rels_start = ways_end.saturating_sub(1);
     let _rels_end = reader.num_blobs();
 
-    let _coverage = Coverage::load(coverage)
+    let coverage = Coverage::load(coverage)
         .with_context(|| format!("could not open coverage file `{:?}`", coverage))?;
 
     // Pass 1: Determine which nodes are located in our coverage area.
     let num_workers = usize::from(thread::available_parallelism()?);
     thread::scope(|s| {
-        let (tx, rx) = sync_channel::<Blob>(num_workers);
-        let producer = s.spawn(move || {
+        let (blob_tx, blob_rx) = sync_channel::<Blob>(num_workers);
+        let (node_tx, node_rx) = sync_channel::<u64>(num_workers * 1024);
+
+        // Blob producer thread, i/o-bound.
+        s.spawn(move || {
             for i in 0..nodes_end {
                 let blob = reader.read_blob(i)?;
-                tx.send(blob)?;
+                blob_tx.send(blob)?;
             }
             Ok(())
         });
-        rx.into_iter().par_bridge().try_for_each(|blob| {
+
+        // Node consumer thread, cpu-bound.
+        s.spawn(move || {
+            let mut num_nodes = 0_u64;
+            for _node_id in node_rx.into_iter() {
+                num_nodes += 1;
+            }
+            println!("*** num_nodes={:?} within coverage area", num_nodes);
+            Ok(())
+        });
+
+        // CPU-bound blob consumers (one for each CPU) concurrently
+        // read and decompress blobs.  For each node within the
+        // spatial coverage area, the node ID is sent to the node
+        // consumer thread.
+        blob_rx.into_iter().par_bridge().try_for_each(|blob| {
+            let node_tx = node_tx.clone();
             let data = blob.into_data(); // decompress
-            let _block = PrimitiveBlock::parse(&data);
+            let block = PrimitiveBlock::parse(&data);
+            for primitive in block.primitives() {
+                if let Primitive::Node(node) = primitive {
+                    let s2_lat_lng = s2::latlng::LatLng::from_degrees(node.lat, node.lon);
+                    let cell_id = s2::cellid::CellID::from(s2_lat_lng);
+                    if coverage.is_covering(&cell_id) {
+                        node_tx.send(node.id)?;
+                    }
+                }
+            }
             Ok(())
         })?;
-        producer.join().expect("panic in producer thread")
+
+        Ok(())
     })?;
 
     Ok(())

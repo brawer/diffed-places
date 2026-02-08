@@ -97,8 +97,11 @@ impl<'a, R: Read + Seek> BlobReader<'a, R> {
             buf.set_len(len);
             self.reader.read_exact(&mut buf)?;
         }
+        Self::decode_blob(&buf)
+    }
 
-        for m in MessageIter::new(&buf) {
+    fn decode_blob(data: &[u8]) -> Result<Blob> {
+        for m in MessageIter::new(data) {
             match m.tag {
                 1 => return Ok(Blob::Raw(Vec::from(m.value.get_data()))),
                 3 => return Ok(Blob::Zlib(Vec::from(m.value.get_data()))),
@@ -106,7 +109,7 @@ impl<'a, R: Read + Seek> BlobReader<'a, R> {
             }
         }
 
-        Err(anyhow!("cannot decode blob {:?}", blob))
+        Err(anyhow!("cannot decode blob"))
     }
 
     /// Partitions the blogs into nodes, ways and relations.
@@ -211,6 +214,22 @@ mod tests {
         } else {
             return Err(anyhow!("failed to read blob"));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_blob_reader_decode() -> Result<()> {
+        if let Blob::Raw(blob) = BlobReader::<File>::decode_blob(&[0x0a, 1, 77])? {
+            assert_eq!(blob, &[77]);
+        } else {
+            panic!("unexpected blob type");
+        }
+        if let Blob::Zlib(blob) = BlobReader::<File>::decode_blob(&[0x1a, 1, 77])? {
+            assert_eq!(blob, &[77]);
+        } else {
+            panic!("unexpected blob type");
+        }
+        assert!(BlobReader::<File>::decode_blob(&[0x2a, 1, 77]).is_err());
         Ok(())
     }
 

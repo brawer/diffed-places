@@ -193,8 +193,10 @@ mod reader {
 
 mod writer {
     use super::{Coverage, S2_CELL_ID_SHIFT, S2_GRANULARITY_LEVEL};
+    use crate::PROGRESS_BAR_STYLE;
     use anyhow::{Ok, Result, anyhow};
     use ext_sort::{ExternalSorter, ExternalSorterBuilder, buffer::LimitedBufferBuilder};
+    use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use parquet::record::RowAccessor;
     use parquet::schema::types::Type;
@@ -209,10 +211,11 @@ mod writer {
     use std::fs::{File, remove_file, rename};
     use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
     /// Computes the spatial coverage of a set of places.
-    pub fn build_coverage(atp: &Path, workdir: &Path) -> Result<PathBuf> {
+    pub fn build_coverage(atp: &Path, progress: &MultiProgress, workdir: &Path) -> Result<PathBuf> {
         assert!(atp.exists());
 
         let out_path = workdir.join("coverage");
@@ -227,8 +230,8 @@ mod writer {
         // https://dev.to/sgchris/scoped-threads-with-stdthreadscope-in-rust-163-48f9
         let (tx, rx) = sync_channel(50_000);
         std::thread::scope(|s| {
-            let producer = s.spawn(|| read_places(atp, tx));
-            let consumer = s.spawn(|| build_spatial_coverage(rx, &out_path));
+            let producer = s.spawn(|| read_places(atp, progress, tx));
+            let consumer = s.spawn(|| build_spatial_coverage(rx, progress, &out_path));
             producer.join().unwrap().and(consumer.join().unwrap())
         })?;
 
@@ -243,17 +246,24 @@ mod writer {
         Ok(out_path)
     }
 
-    fn read_places(places: &Path, covering: SyncSender<CellID>) -> Result<()> {
+    fn read_places(
+        places: &Path,
+        progress: &MultiProgress,
+        covering: SyncSender<CellID>,
+    ) -> Result<()> {
         use anyhow::Context;
         let file =
             File::open(places).with_context(|| format!("could not open file `{:?}`", places))?;
         let reader = SerializedFileReader::new(file)?;
         let metadata = reader.metadata();
-        let schema = metadata.file_metadata().schema();
+        let file_metadata = metadata.file_metadata();
+        let schema = file_metadata.schema();
         let s2_cell_id_column = column_index("s2_cell_id", schema)?;
         // let source_column = column_index("source", schema)?;
         let tags_column = column_index("tags", schema)?;
         let num_row_groups = reader.num_row_groups();
+        let num_rows: i64 = file_metadata.num_rows();
+        let num_rows: u64 = if num_rows < 0 { 0 } else { num_rows as u64 };
 
         let large_radius = meters_to_chord_angle(100.0);
         let small_radius = meters_to_chord_angle(10.0);
@@ -263,6 +273,11 @@ mod writer {
             max_level: S2_GRANULARITY_LEVEL,
             level_mod: 1,
         };
+
+        let bar = progress.add(ProgressBar::new(num_rows));
+        bar.set_style(ProgressStyle::with_template(PROGRESS_BAR_STYLE)?);
+        bar.set_prefix("cov.read ");
+        bar.set_message("features");
 
         (0..num_row_groups)
             .into_par_iter()
@@ -303,10 +318,13 @@ mod writer {
                     for cell_id in coverer.covering(&cap).0.into_iter() {
                         covering.send(cell_id)?;
                     }
+                    bar.inc(1);
                 }
+
                 Ok(())
             })?;
 
+        bar.finish();
         Ok(())
     }
 
@@ -326,11 +344,16 @@ mod writer {
     }
 
     /// Builds a spatial coverage file from a stream of s2::CellIDs.
-    fn build_spatial_coverage(cells: Receiver<CellID>, out: &Path) -> Result<()> {
+    fn build_spatial_coverage(
+        cells: Receiver<CellID>,
+        progress: &MultiProgress,
+        out: &Path,
+    ) -> Result<()> {
         let mut tmp = PathBuf::from(out);
         tmp.add_extension("tmp");
 
         let mut writer = CoverageWriter::try_new(&tmp)?;
+        let num_cells = AtomicU64::new(0);
         let sorter: ExternalSorter<CellID, std::io::Error, LimitedBufferBuilder> =
             ExternalSorterBuilder::new()
                 .with_tmp_dir(Path::new("./"))
@@ -338,12 +361,25 @@ mod writer {
                     1_000_000, /* preallocate */ true,
                 ))
                 .build()?;
-        let sorted = sorter.sort(cells.iter().map(std::io::Result::Ok))?;
+        let sorted = sorter.sort(cells.iter().map(|x| {
+            num_cells.fetch_add(1, Ordering::SeqCst);
+            std::io::Result::Ok(x)
+        }))?;
+
+        let bar = progress.add(ProgressBar::new(num_cells.load(Ordering::SeqCst)));
+        bar.set_style(ProgressStyle::with_template(PROGRESS_BAR_STYLE)?);
+        bar.set_prefix("cov.write");
+        bar.set_message("s2 cells");
+
         for cur in sorted {
             writer.write(cur?.0 >> S2_CELL_ID_SHIFT)?;
+            bar.inc(1);
         }
+
         writer.close()?;
         rename(&tmp, out)?;
+        bar.finish();
+
         Ok(())
     }
 
@@ -482,6 +518,7 @@ mod writer {
         use super::super::Coverage;
         use super::{CoverageWriter, S2_CELL_ID_SHIFT, S2_GRANULARITY_LEVEL, build_coverage};
         use anyhow::{Ok, Result};
+        use indicatif::{MultiProgress, ProgressDrawTarget};
         use s2::cellid::CellID;
         use std::path::PathBuf;
         use tempfile::{NamedTempFile, TempDir};
@@ -501,7 +538,8 @@ mod writer {
             atp.push("tests/test_data/alltheplaces.parquet");
             let workdir = TempDir::new()?;
             symlink(&atp, workdir.path().join("alltheplaces.parquet"))?;
-            let coverage = build_coverage(&atp, workdir.path())?;
+            let progress = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+            let coverage = build_coverage(&atp, &progress, workdir.path())?;
             assert!(coverage.exists());
             Ok(())
         }

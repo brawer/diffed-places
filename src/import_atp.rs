@@ -3,17 +3,20 @@ use ext_sort::{ExternalSorter, ExternalSorterBuilder, buffer::mem::MemoryLimited
 use geo::algorithm::line_measures::Haversine;
 use geo::{InteriorPoint, InterpolateLine, Point};
 use geojson::GeoJson;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use piz::ZipArchive;
 use rayon::prelude::*;
 use std::fs::{File, rename};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
+use crate::PROGRESS_BAR_STYLE;
 use crate::place::{ParquetWriter, Place};
 
-pub fn import_atp(input: &Path, workdir: &Path) -> Result<PathBuf> {
+pub fn import_atp(input: &Path, progress: &MultiProgress, workdir: &Path) -> Result<PathBuf> {
     let out = workdir.join("alltheplaces.parquet");
     if !out.exists() {
         log::info!("import_atp is starting");
@@ -26,8 +29,8 @@ pub fn import_atp(input: &Path, workdir: &Path) -> Result<PathBuf> {
     // https://dev.to/sgchris/scoped-threads-with-stdthreadscope-in-rust-163-48f9
     let (tx, rx) = sync_channel(50_000);
     let (ra, rb) = std::thread::scope(|s| {
-        let r1 = s.spawn(|| process_places(rx, workdir, &out));
-        let r2 = s.spawn(|| process_zip(input, tx));
+        let r1 = s.spawn(|| process_places(rx, progress, workdir, &out));
+        let r2 = s.spawn(|| process_zip(input, progress, tx));
         (r1.join().unwrap(), r2.join().unwrap())
     });
     ra?;
@@ -36,7 +39,12 @@ pub fn import_atp(input: &Path, workdir: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
-fn process_places(places: Receiver<Place>, workdir: &Path, out: &Path) -> Result<()> {
+fn process_places(
+    places: Receiver<Place>,
+    progress: &MultiProgress,
+    workdir: &Path,
+    out: &Path,
+) -> Result<()> {
     let mut tmp = PathBuf::from(out);
     tmp.add_extension("tmp");
 
@@ -46,36 +54,55 @@ fn process_places(places: Receiver<Place>, workdir: &Path, out: &Path) -> Result
             .with_tmp_dir(workdir)
             .with_buffer(MemoryLimitedBufferBuilder::new(150_000_000))
             .build()?;
-    let sorted = sorter.sort(places.iter().map(std::io::Result::Ok))?;
-    let mut num_places = 0;
+
+    let num_features = AtomicU64::new(0);
+    let sorted = sorter.sort(places.iter().map(|x| {
+        num_features.fetch_add(1, Ordering::SeqCst);
+        std::io::Result::Ok(x)
+    }))?;
+    let num_features = num_features.load(Ordering::SeqCst);
+
+    let bar = progress.add(ProgressBar::new(num_features));
+    bar.set_style(ProgressStyle::with_template(PROGRESS_BAR_STYLE)?);
+    bar.set_prefix("atp.write");
+    bar.set_message("features");
+
     for place in sorted {
-        num_places += 1;
         writer.write(place?)?;
+        bar.inc(1);
     }
     writer.close()?;
     rename(&tmp, out)?;
+    bar.finish_with_message(format!("{} features", num_features));
 
     log::info!(
-        "import_atp finished, built {:?} with {:?} places",
+        "import_atp finished, built {:?} with {:?} features",
         out,
-        num_places
+        num_features
     );
     Ok(())
 }
 
-fn process_zip(path: &Path, channel: SyncSender<Place>) -> Result<()> {
+fn process_zip(path: &Path, progress: &MultiProgress, channel: SyncSender<Place>) -> Result<()> {
     let file = File::open(path).with_context(|| format!("could not open file `{:?}`", path))?;
     let mapping = unsafe { Mmap::map(&file).context("Couldn't mmap zip file")? };
     let archive = ZipArchive::with_prepended_data(&mapping)
         .context("Couldn't load archive")?
         .0;
+    let bar = progress.add(ProgressBar::new(archive.entries().len() as u64));
+    bar.set_prefix("atp.read ");
+    bar.set_style(ProgressStyle::with_template(PROGRESS_BAR_STYLE)?);
+    bar.set_message("feature collections");
+
     archive.entries().par_iter().try_for_each(|entry| {
         if entry.size > 0 {
             let reader = archive.read(entry)?;
             process_geojson(reader, Some(channel.clone()))?;
         }
+        bar.inc(1);
         Ok(())
     })?;
+    bar.finish();
     Ok(())
 }
 

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
+use indicatif::MultiProgress;
 use std::fs::create_dir;
 
 use diffed_places::{build_coverage, import_atp, import_osm};
@@ -32,12 +33,14 @@ fn main() -> Result<()> {
     env_logger::init();
     match &args.command {
         Some(Commands::Run { atp, osm, workdir }) => {
+            let progress = MultiProgress::new();
             if !workdir.exists() {
                 create_dir(workdir)?;
             }
-            let atp = import_atp(atp, workdir)?;
-            let coverage = build_coverage(&atp, workdir)?;
-            import_osm(osm, &coverage, workdir)?;
+
+            let atp = import_atp(atp, &progress, workdir)?;
+            let coverage = build_coverage(&atp, &progress, workdir)?;
+            import_osm(osm, &coverage, &progress, workdir)?;
             Ok(())
         }
         None => Err(anyhow!("no subcommand given")),

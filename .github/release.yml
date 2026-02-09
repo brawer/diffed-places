@@ -2,12 +2,20 @@
 
 changelog:
   categories:
-    - title: 🏕 Features
+    - title: 🆕 Enhancements
+      labels:
+        - enhancement
+    - title: 🐞 Bugs
+      labels:
+        - bug
+    - title: 🔗 Dependencies
+      labels:
+        - dependencies
+    - title: 🚧 Maintenance
       labels:
         - '*'
       exclude:
         labels:
+          - bug
           - dependencies
-    - title: 👒 Dependencies
-      labels:
-        - dependencies
+          - enhancement

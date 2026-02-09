@@ -206,19 +206,29 @@ mod writer {
         region::RegionCoverer,
         s1::{Angle, ChordAngle},
     };
-    use std::fs::{File, remove_file};
+    use std::fs::{File, remove_file, rename};
     use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
     /// Computes the spatial coverage of a set of places.
-    pub fn build_coverage(places: &Path, output: &Path) -> Result<()> {
+    pub fn build_coverage(atp: &Path, workdir: &Path) -> Result<PathBuf> {
+        assert!(atp.exists());
+
+        let out_path = workdir.join("coverage");
+        if out_path.exists() {
+            log::info!("skipping build_coverage, already found {:?}", out_path);
+            return Ok(out_path);
+        } else {
+            log::info!("build_coverage is starting");
+        }
+
         // To avoid deadlock, we must not use Rayon threads here.
         // https://dev.to/sgchris/scoped-threads-with-stdthreadscope-in-rust-163-48f9
         let (tx, rx) = sync_channel(50_000);
         std::thread::scope(|s| {
-            let producer = s.spawn(|| read_places(places, tx));
-            let consumer = s.spawn(|| build_spatial_coverage(rx, output));
+            let producer = s.spawn(|| read_places(atp, tx));
+            let consumer = s.spawn(|| build_spatial_coverage(rx, &out_path));
             producer.join().unwrap().and(consumer.join().unwrap())
         })?;
 
@@ -226,9 +236,11 @@ mod writer {
         // This verifies the presence of the correct file signature, and that
         // the run_starts and run_lengths array are correctly aligned and
         // within allowable bounds.
-        _ = Coverage::load(output)?;
+        _ = Coverage::load(&out_path)?;
 
-        Ok(())
+        log::info!("build_spatial_coverage finished, built {:?}", out_path);
+
+        Ok(out_path)
     }
 
     fn read_places(places: &Path, covering: SyncSender<CellID>) -> Result<()> {
@@ -315,7 +327,10 @@ mod writer {
 
     /// Builds a spatial coverage file from a stream of s2::CellIDs.
     fn build_spatial_coverage(cells: Receiver<CellID>, out: &Path) -> Result<()> {
-        let mut writer = CoverageWriter::try_new(out)?;
+        let mut tmp = PathBuf::from(out);
+        tmp.add_extension("tmp");
+
+        let mut writer = CoverageWriter::try_new(&tmp)?;
         let sorter: ExternalSorter<CellID, std::io::Error, LimitedBufferBuilder> =
             ExternalSorterBuilder::new()
                 .with_tmp_dir(Path::new("./"))
@@ -328,6 +343,7 @@ mod writer {
             writer.write(cur?.0 >> S2_CELL_ID_SHIFT)?;
         }
         writer.close()?;
+        rename(&tmp, out)?;
         Ok(())
     }
 
@@ -468,7 +484,7 @@ mod writer {
         use anyhow::{Ok, Result};
         use s2::cellid::CellID;
         use std::path::PathBuf;
-        use tempfile::NamedTempFile;
+        use tempfile::{NamedTempFile, TempDir};
 
         #[test]
         fn test_cell_id_shift() {
@@ -480,10 +496,14 @@ mod writer {
 
         #[test]
         fn test_build_coverage() -> Result<()> {
+            use std::os::unix::fs::symlink;
             let mut atp = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             atp.push("tests/test_data/alltheplaces.parquet");
-            let spatial_cov = NamedTempFile::new()?;
-            build_coverage(&atp, spatial_cov.path())
+            let workdir = TempDir::new()?;
+            symlink(&atp, workdir.path().join("alltheplaces.parquet"))?;
+            let coverage = build_coverage(&atp, workdir.path())?;
+            assert!(coverage.exists());
+            Ok(())
         }
 
         #[test]

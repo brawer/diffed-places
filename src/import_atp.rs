@@ -6,32 +6,44 @@ use geojson::GeoJson;
 use memmap2::Mmap;
 use piz::ZipArchive;
 use rayon::prelude::*;
-use std::fs::File;
+use std::fs::{File, rename};
 use std::io::{BufRead, BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 use crate::place::{ParquetWriter, Place};
 
-pub fn import_atp(input: &Path, output: &Path) -> Result<()> {
+pub fn import_atp(input: &Path, workdir: &Path) -> Result<PathBuf> {
+    let out = workdir.join("alltheplaces.parquet");
+    if !out.exists() {
+        log::info!("import_atp is starting");
+    } else {
+        log::info!("skipping import_atp, already found {:?}", out);
+        return Ok(out);
+    }
+
     // To avoid deadlock, we must not use Rayon threads here.
     // https://dev.to/sgchris/scoped-threads-with-stdthreadscope-in-rust-163-48f9
     let (tx, rx) = sync_channel(50_000);
     let (ra, rb) = std::thread::scope(|s| {
-        let r1 = s.spawn(|| process_places(rx, output));
+        let r1 = s.spawn(|| process_places(rx, workdir, &out));
         let r2 = s.spawn(|| process_zip(input, tx));
         (r1.join().unwrap(), r2.join().unwrap())
     });
     ra?;
     rb?;
-    Ok(())
+
+    Ok(out)
 }
 
-fn process_places(places: Receiver<Place>, out: &Path) -> Result<()> {
-    let mut writer = ParquetWriter::try_new(/* batch size */ 64 * 1024, out)?;
+fn process_places(places: Receiver<Place>, workdir: &Path, out: &Path) -> Result<()> {
+    let mut tmp = PathBuf::from(out);
+    tmp.add_extension("tmp");
+
+    let mut writer = ParquetWriter::try_new(/* batch size */ 64 * 1024, &tmp)?;
     let sorter: ExternalSorter<Place, std::io::Error, MemoryLimitedBufferBuilder> =
         ExternalSorterBuilder::new()
-            .with_tmp_dir(Path::new("./"))
+            .with_tmp_dir(workdir)
             .with_buffer(MemoryLimitedBufferBuilder::new(150_000_000))
             .build()?;
     let sorted = sorter.sort(places.iter().map(std::io::Result::Ok))?;
@@ -41,7 +53,13 @@ fn process_places(places: Receiver<Place>, out: &Path) -> Result<()> {
         writer.write(place?)?;
     }
     writer.close()?;
-    println!("got {} places", num_places);
+    rename(&tmp, out)?;
+
+    log::info!(
+        "import_atp finished, built {:?} with {:?} places",
+        out,
+        num_places
+    );
     Ok(())
 }
 

@@ -3,8 +3,7 @@ use ext_sort::{ExternalSorter, ExternalSorterBuilder, buffer::LimitedBufferBuild
 use osm_pbf_iter::{Blob, Primitive, PrimitiveBlock};
 use protobuf_iter::MessageIter;
 use rayon::prelude::*;
-use s2;
-use std::fs::{File, create_dir};
+use std::fs::{File, rename};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, sync_channel};
@@ -13,9 +12,7 @@ use std::thread;
 use crate::coverage::Coverage;
 
 pub fn import_osm(pbf: &Path, coverage: &Path, workdir: &Path) -> Result<()> {
-    if !workdir.exists() {
-        create_dir(workdir)?;
-    }
+    assert!(workdir.exists());
 
     let pbf_error = || format!("could not open file `{:?}`", pbf);
     let mut file = File::open(pbf).with_context(pbf_error)?;
@@ -41,10 +38,7 @@ pub fn import_osm(pbf: &Path, coverage: &Path, workdir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_sorted(stream: Receiver<u64>, out: &Path) -> Result<()> {
-    let Some(workdir) = out.parent() else {
-        return Err(anyhow!("coult not get parent directory of {:?}", out));
-    };
+fn write_sorted(stream: Receiver<u64>, workdir: &Path, out: &Path) -> Result<()> {
     let sorter: ExternalSorter<u64, std::io::Error, LimitedBufferBuilder> =
         ExternalSorterBuilder::new()
             .with_tmp_dir(workdir)
@@ -69,9 +63,18 @@ fn build_covered_nodes<R: Read + Seek + Send>(
     workdir: &Path,
 ) -> Result<PathBuf> {
     let out = workdir.join("covered-nodes");
-    if out.exists() {
+    if !out.exists() {
+        log::info!("import_osm::build_covered_nodes is starting");
+    } else {
+        log::info!(
+            "skipping import_osm::build_covered_nodes, already found {:?}",
+            out
+        );
         return Ok(out);
     }
+
+    let mut tmp = out.clone();
+    tmp.add_extension("tmp");
 
     let num_workers = usize::from(thread::available_parallelism()?);
     thread::scope(|s| {
@@ -109,9 +112,13 @@ fn build_covered_nodes<R: Read + Seek + Send>(
             })
         });
 
-        // Node consumer thread.
-        write_sorted(node_rx, &out)
+        // Node consumer thread. Sorts a stream of node ids, which it
+        // receives from the blob consumers over the channel `node_rx`,
+        // into a ´temporary file located at `tmp`.
+        write_sorted(node_rx, workdir, &tmp)
     })?;
+
+    rename(&tmp, &out)?;
     Ok(out)
 }
 

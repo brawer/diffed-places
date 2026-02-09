@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
+use std::fs::create_dir;
 
 use diffed_places::{build_coverage, import_atp, import_osm};
 
@@ -14,26 +15,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    ImportAtp {
+    Run {
         #[arg(short, long, value_name = "alltheplaces.zip")]
-        input: PathBuf,
+        atp: PathBuf,
 
-        #[arg(short, long, value_name = "alltheplaces.parquet")]
-        output: PathBuf,
-    },
-    BuildCoverage {
-        #[arg(short, long, value_name = "alltheplaces.parquet")]
-        places: PathBuf,
-
-        #[arg(short, long, value_name = "coverage")]
-        output: PathBuf,
-    },
-    ImportOsm {
         #[arg(long, value_name = "openstreetmap.pbf")]
         osm: PathBuf,
-
-        #[arg(long, value_name = "coverage")]
-        coverage: PathBuf,
 
         #[arg(short, long, value_name = "workdir")]
         workdir: PathBuf,
@@ -42,14 +29,17 @@ enum Commands {
 
 fn main() -> Result<()> {
     let args = Cli::parse();
+    env_logger::init();
     match &args.command {
-        Some(Commands::ImportAtp { input, output }) => import_atp(input, output),
-        Some(Commands::BuildCoverage { places, output }) => build_coverage(places, output),
-        Some(Commands::ImportOsm {
-            osm,
-            coverage,
-            workdir,
-        }) => import_osm(osm, coverage, workdir),
+        Some(Commands::Run { atp, osm, workdir }) => {
+            if !workdir.exists() {
+                create_dir(workdir)?;
+            }
+            let atp = import_atp(atp, workdir)?;
+            let coverage = build_coverage(&atp, workdir)?;
+            import_osm(osm, &coverage, workdir)?;
+            Ok(())
+        }
         None => Err(anyhow!("no subcommand given")),
     }
 }

@@ -1,17 +1,22 @@
 use anyhow::{Context, Ok, Result, anyhow};
+use ext_sort::{ExternalSorter, ExternalSorterBuilder, buffer::LimitedBufferBuilder};
 use osm_pbf_iter::{Blob, Primitive, PrimitiveBlock};
 use protobuf_iter::MessageIter;
 use rayon::prelude::*;
 use s2;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
-use std::sync::mpsc::sync_channel;
+use std::fs::{File, create_dir};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread;
 
 use crate::coverage::Coverage;
 
-pub fn import_osm(pbf: &Path, coverage: &Path, _output: &Path) -> Result<()> {
+pub fn import_osm(pbf: &Path, coverage: &Path, workdir: &Path) -> Result<()> {
+    if !workdir.exists() {
+        create_dir(workdir)?;
+    }
+
     let pbf_error = || format!("could not open file `{:?}`", pbf);
     let mut file = File::open(pbf).with_context(pbf_error)?;
     let mut reader = BlobReader::try_new(&mut file).with_context(pbf_error)?;
@@ -19,6 +24,7 @@ pub fn import_osm(pbf: &Path, coverage: &Path, _output: &Path) -> Result<()> {
     // Partition the PBF file into blobs with nodes, ways and relations.
     // Ranges may overlap by one blob, see BlobReader::partition().
     let (nodes_end, ways_end) = reader.partition()?;
+    let node_blobs = (0, nodes_end);
     let _ways_start = nodes_end.saturating_sub(1);
     let _rels_start = ways_end.saturating_sub(1);
     let _rels_end = reader.num_blobs();
@@ -26,28 +32,58 @@ pub fn import_osm(pbf: &Path, coverage: &Path, _output: &Path) -> Result<()> {
     let coverage = Coverage::load(coverage)
         .with_context(|| format!("could not open coverage file `{:?}`", coverage))?;
 
-    // Pass 1: Determine which nodes are located in our coverage area.
+    // Find which nodes lie within our coverage area of interest.
+    let _covered_nodes = build_covered_nodes(&mut reader, node_blobs, &coverage, workdir)?;
+
+    // TODO: Find which ways lie within the coverage area, passing covered_nodes.
+    // TODO: Find which relations lie within the coverage area, passing covered_nodes and covered_ways.
+
+    Ok(())
+}
+
+fn write_sorted(stream: Receiver<u64>, out: &Path) -> Result<()> {
+    let Some(workdir) = out.parent() else {
+        return Err(anyhow!("coult not get parent directory of {:?}", out));
+    };
+    let sorter: ExternalSorter<u64, std::io::Error, LimitedBufferBuilder> =
+        ExternalSorterBuilder::new()
+            .with_tmp_dir(workdir)
+            .with_buffer(LimitedBufferBuilder::new(
+                5_000_000, /* preallocate */ true,
+            ))
+            .build()?;
+    let sorted = sorter.sort(stream.into_iter().map(std::io::Result::Ok))?;
+    let file = File::create(out)?;
+    let mut writer = BufWriter::with_capacity(32768, file);
+    for value in sorted {
+        writer.write_all(&value?.to_le_bytes())?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn build_covered_nodes<R: Read + Seek + Send>(
+    reader: &mut BlobReader<R>,
+    blobs: (usize, usize),
+    coverage: &Coverage,
+    workdir: &Path,
+) -> Result<PathBuf> {
+    let out = workdir.join("covered-nodes");
+    if out.exists() {
+        return Ok(out);
+    }
+
     let num_workers = usize::from(thread::available_parallelism()?);
     thread::scope(|s| {
         let (blob_tx, blob_rx) = sync_channel::<Blob>(num_workers);
         let (node_tx, node_rx) = sync_channel::<u64>(num_workers * 1024);
 
-        // Blob producer thread, i/o-bound.
+        // Blob producer thread, I/O-bound.
         s.spawn(move || {
-            for i in 0..nodes_end {
+            for i in blobs.0..blobs.1 {
                 let blob = reader.read_blob(i)?;
                 blob_tx.send(blob)?;
             }
-            Ok(())
-        });
-
-        // Node consumer thread, cpu-bound.
-        s.spawn(move || {
-            let mut num_nodes = 0_u64;
-            for _node_id in node_rx.into_iter() {
-                num_nodes += 1;
-            }
-            println!("*** num_nodes={:?} within coverage area", num_nodes);
             Ok(())
         });
 
@@ -55,37 +91,44 @@ pub fn import_osm(pbf: &Path, coverage: &Path, _output: &Path) -> Result<()> {
         // read and decompress blobs.  For each node within the
         // spatial coverage area, the node ID is sent to the node
         // consumer thread.
-        blob_rx.into_iter().par_bridge().try_for_each(|blob| {
-            let node_tx = node_tx.clone();
-            let data = blob.into_data(); // decompress
-            let block = PrimitiveBlock::parse(&data);
-            for primitive in block.primitives() {
-                if let Primitive::Node(node) = primitive {
-                    let s2_lat_lng = s2::latlng::LatLng::from_degrees(node.lat, node.lon);
-                    let cell_id = s2::cellid::CellID::from(s2_lat_lng);
-                    if coverage.is_covering(&cell_id) {
-                        node_tx.send(node.id)?;
+        s.spawn(move || {
+            blob_rx.into_iter().par_bridge().try_for_each(|blob| {
+                let node_tx = node_tx.clone();
+                let data = blob.into_data(); // decompress
+                let block = PrimitiveBlock::parse(&data);
+                for primitive in block.primitives() {
+                    if let Primitive::Node(node) = primitive {
+                        let s2_lat_lng = s2::latlng::LatLng::from_degrees(node.lat, node.lon);
+                        let cell_id = s2::cellid::CellID::from(s2_lat_lng);
+                        if coverage.is_covering(&cell_id) {
+                            node_tx.send(node.id)?;
+                        }
                     }
                 }
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })
+        });
 
-        Ok(())
+        // Node consumer thread.
+        write_sorted(node_rx, &out)
     })?;
-
-    Ok(())
+    Ok(out)
 }
 
 /// Reads data blobs from OpenStreetMap PBF files.
-struct BlobReader<'a, R: Read + Seek> {
+struct BlobReader<'a, R: Read + Seek + Send> {
     reader: &'a mut R,
 
     /// Offset and size of each data blob.
     blobs: Vec<(u64, usize)>,
 }
 
-impl<'a, R: Read + Seek> BlobReader<'a, R> {
+// SAFETY: Can be safely sent across threads, if the underlying reader
+// implements the Send trait. With the type trait being declared as
+// below (`+ Send`), this gets enforced by the Rust compiler.
+unsafe impl<'a, R: Read + Seek + Send> Send for BlobReader<'a, R> {}
+
+impl<'a, R: Read + Seek + Send> BlobReader<'a, R> {
     pub fn try_new(reader: &'a mut R) -> Result<BlobReader<'a, R>> {
         reader.seek(SeekFrom::End(0))?;
         let file_size = reader.stream_position()?;

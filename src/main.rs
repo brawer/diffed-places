@@ -35,8 +35,8 @@ enum Commands {
         #[arg(long, value_name = "coverage")]
         coverage: PathBuf,
 
-        #[arg(short, long, value_name = "openstreetmap.parquet")]
-        output: PathBuf,
+        #[arg(short, long, value_name = "workdir")]
+        workdir: PathBuf,
     },
 }
 
@@ -48,8 +48,8 @@ fn main() -> Result<()> {
         Some(Commands::ImportOsm {
             osm,
             coverage,
-            output,
-        }) => import_osm(osm, coverage, output),
+            workdir,
+        }) => import_osm(osm, coverage, workdir),
         None => Err(anyhow!("no subcommand given")),
     }
 }

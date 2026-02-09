@@ -2,12 +2,13 @@ use anyhow::{Ok, Result};
 use assert_cmd::{Command, cargo_bin};
 use predicates;
 use std::path::PathBuf;
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 
 #[test]
 fn test_pipeline() -> Result<()> {
     let mut test_data = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     test_data.push("tests/test_data");
+    let workdir = TempDir::new()?;
 
     let mut alltheplaces_zip = test_data.clone();
     alltheplaces_zip.push("alltheplaces.zip");
@@ -33,15 +34,14 @@ fn test_pipeline() -> Result<()> {
 
     let mut zugerland_osm_pbf = test_data.clone();
     zugerland_osm_pbf.push("zugerland.osm.pbf");
-    let osm_parquet = NamedTempFile::new()?;
     Command::new(cargo_bin!("diffed-places"))
         .arg("import-osm")
         .arg("--osm")
         .arg(&zugerland_osm_pbf)
         .arg("--coverage")
         .arg(coverage.path())
-        .arg("--output")
-        .arg(osm_parquet.path())
+        .arg("--workdir")
+        .arg(workdir.path())
         .assert()
         .success();
 
@@ -96,7 +96,7 @@ fn test_import_osm_bad_input_path() -> Result<()> {
     osm.push("zugerland.osm.pbf");
     let mut coverage = test_data.clone();
     coverage.push("alltheplaces.coverage");
-    let output = NamedTempFile::new()?;
+    let workdir = TempDir::new()?;
 
     // OpenStreetMap file does not exist.
     Command::new(cargo_bin!("diffed-places"))
@@ -105,8 +105,8 @@ fn test_import_osm_bad_input_path() -> Result<()> {
         .arg("test/file/does-not-exist")
         .arg("--coverage")
         .arg(&coverage)
-        .arg("--output")
-        .arg(output.path())
+        .arg("--workdir")
+        .arg(workdir.path())
         .assert()
         .failure()
         .stderr(predicates::str::contains("could not open file"))
@@ -119,8 +119,8 @@ fn test_import_osm_bad_input_path() -> Result<()> {
         .arg(&osm)
         .arg("--coverage")
         .arg("test/coverage-file/does-not-exist")
-        .arg("--output")
-        .arg(output.path())
+        .arg("--workdir")
+        .arg(workdir.path())
         .assert()
         .failure()
         .stderr(predicates::str::contains("could not open coverage file"))

@@ -3,6 +3,8 @@ use memmap2::Mmap;
 use std::fs::File;
 use std::path::Path;
 
+pub use writer::create;
+
 /// A memory-mapped file with sorted 64-bit integers in little-endian encoding.
 ///
 /// Used in the pipeline to represent large sets of identifiers that may not
@@ -96,5 +98,69 @@ mod tests {
         assert_eq!(table.contains(19), false);
 
         Ok(())
+    }
+}
+
+mod writer {
+    use anyhow::{Ok, Result};
+    use ext_sort::{ExternalSorter, ExternalSorterBuilder, buffer::LimitedBufferBuilder};
+    use std::fs::File;
+    use std::io::{BufWriter, Write};
+    use std::path::Path;
+    use std::sync::mpsc::Receiver;
+
+    pub fn create(stream: Receiver<u64>, workdir: &Path, out: &Path) -> Result<u64> {
+        let sorter: ExternalSorter<u64, std::io::Error, LimitedBufferBuilder> =
+            ExternalSorterBuilder::new()
+                .with_tmp_dir(workdir)
+                .with_buffer(LimitedBufferBuilder::new(
+                    /* buffer_size */ 5_000_000, /* preallocate */ true,
+                ))
+                .build()?;
+        let sorted = sorter.sort(stream.into_iter().map(std::io::Result::Ok))?;
+        let file = File::create(out)?;
+        let mut writer = BufWriter::with_capacity(32768, file);
+        let mut num_values = 0;
+        for value in sorted {
+            writer.write_all(&value?.to_le_bytes())?;
+            num_values += 1;
+        }
+        writer.flush()?;
+        Ok(num_values)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::U64Table;
+        use anyhow::{Ok, Result};
+        use std::sync::mpsc::sync_channel;
+
+        #[test]
+        fn test_create() -> Result<()> {
+            let (tx, rx) = sync_channel::<u64>(10);
+            let tmp = tempfile::TempDir::new()?;
+            let out = tmp.path().join("test.u64_table");
+
+            tx.send(42)?;
+            tx.send(23)?;
+            tx.send(77)?;
+            drop(tx);
+
+            let num_written = super::create(
+                /* stream */ rx,
+                /* workdir */ tmp.path(),
+                /* out */ &out,
+            )?;
+            assert_eq!(num_written, 3);
+
+            let table = U64Table::open(&out)?;
+            assert_eq!(table.contains(4), false);
+            assert_eq!(table.contains(23), true);
+            assert_eq!(table.contains(42), true);
+            assert_eq!(table.contains(77), true);
+            assert_eq!(table.contains(123), false);
+
+            Ok(())
+        }
     }
 }

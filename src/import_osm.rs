@@ -1,15 +1,14 @@
 use anyhow::{Context, Ok, Result, anyhow};
-use ext_sort::{ExternalSorter, ExternalSorterBuilder, buffer::LimitedBufferBuilder};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use osm_pbf_iter::{Blob, Primitive, PrimitiveBlock, RelationMemberType};
 use protobuf_iter::MessageIter;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::{File, rename};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::mpsc::sync_channel;
 use std::thread;
 
 use crate::PROGRESS_BAR_STYLE;
@@ -55,26 +54,6 @@ pub fn import_osm(
     )?;
 
     Ok(())
-}
-
-fn write_u64_table(stream: Receiver<u64>, workdir: &Path, out: &Path) -> Result<u64> {
-    let sorter: ExternalSorter<u64, std::io::Error, LimitedBufferBuilder> =
-        ExternalSorterBuilder::new()
-            .with_tmp_dir(workdir)
-            .with_buffer(LimitedBufferBuilder::new(
-                5_000_000, /* preallocate */ true,
-            ))
-            .build()?;
-    let sorted = sorter.sort(stream.into_iter().map(std::io::Result::Ok))?;
-    let file = File::create(out)?;
-    let mut writer = BufWriter::with_capacity(32768, file);
-    let mut num_values = 0;
-    for value in sorted {
-        writer.write_all(&value?.to_le_bytes())?;
-        num_values += 1;
-    }
-    writer.flush()?;
-    Ok(num_values)
 }
 
 fn build_relations_graph<R: Read + Seek + Send>(
@@ -213,7 +192,7 @@ fn build_covered_nodes<R: Read + Seek + Send>(
         // Consumer thread. Sorts a stream of node ids, which it
         // receives from the blob consumers over the channel `node_rx`,
         // into a temporary file.
-        num_covered_nodes = write_u64_table(node_rx, workdir, &tmp)?;
+        num_covered_nodes = crate::u64_table::create(node_rx, workdir, &tmp)?;
         Ok(())
     })?;
 
@@ -297,7 +276,7 @@ fn build_covered_ways<R: Read + Seek + Send>(
         // Consumer thread. Sorts a stream of way ids, which it
         // receives from the blob consumers over the channel `way_rx`,
         // into a temporary file.
-        num_covered_ways = write_u64_table(way_rx, workdir, &tmp)?;
+        num_covered_ways = crate::u64_table::create(way_rx, workdir, &tmp)?;
         Ok(())
     })?;
 
@@ -393,7 +372,7 @@ fn build_covered_relations<R: Read + Seek + Send>(
         // Consumer thread. Sorts a stream of relation ids, which it
         // receives from the blob consumers over the channel `rel_rx`,
         // into a temporary file.
-        num_relations = write_u64_table(rel_rx, workdir, &tmp)?;
+        num_relations = crate::u64_table::create(rel_rx, workdir, &tmp)?;
         Ok(())
     })?;
 

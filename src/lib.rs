@@ -2,6 +2,7 @@ mod coverage;
 mod import_atp;
 mod import_osm;
 mod place;
+mod u64_table;
 
 // Re-exported for main.rs.
 pub use coverage::build_coverage;

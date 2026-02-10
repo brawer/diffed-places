@@ -14,6 +14,7 @@ use std::thread;
 
 use crate::PROGRESS_BAR_STYLE;
 use crate::coverage::Coverage;
+use crate::u64_table::U64Table;
 
 pub fn import_osm(
     pbf: &Path,
@@ -56,7 +57,7 @@ pub fn import_osm(
     Ok(())
 }
 
-fn write_sorted(stream: Receiver<u64>, workdir: &Path, out: &Path) -> Result<usize> {
+fn write_u64_table(stream: Receiver<u64>, workdir: &Path, out: &Path) -> Result<u64> {
     let sorter: ExternalSorter<u64, std::io::Error, LimitedBufferBuilder> =
         ExternalSorterBuilder::new()
             .with_tmp_dir(workdir)
@@ -84,8 +85,8 @@ fn build_relations_graph<R: Read + Seek + Send>(
     let num_blobs = blobs.1 - blobs.0;
     let bar = Arc::new(progress.add(ProgressBar::new(num_blobs as u64)));
     bar.set_style(ProgressStyle::with_template(PROGRESS_BAR_STYLE)?);
-    bar.set_prefix("osm.relgr");
-    bar.set_message("pbf blobs");
+    bar.set_prefix("osm.grf.r");
+    bar.set_message("blobs");
 
     let mut result = HashMap::<u64, u64>::new();
     let num_workers = usize::from(thread::available_parallelism()?);
@@ -148,7 +149,7 @@ fn build_covered_nodes<R: Read + Seek + Send>(
     coverage: &Coverage,
     progress: &MultiProgress,
     workdir: &Path,
-) -> Result<PathBuf> {
+) -> Result<U64Table> {
     let num_blobs = blobs.1 - blobs.0;
     let bar = Arc::new(progress.add(ProgressBar::new(num_blobs as u64)));
     bar.set_style(ProgressStyle::with_template(PROGRESS_BAR_STYLE)?);
@@ -163,13 +164,13 @@ fn build_covered_nodes<R: Read + Seek + Send>(
             "skipping import_osm::build_covered_nodes, already found {:?}",
             out
         );
-        return Ok(out);
+        return Ok(U64Table::open(&out)?);
     }
 
     let mut tmp = out.clone();
     tmp.add_extension("tmp");
 
-    let mut num_nodes = 0;
+    let mut num_covered_nodes = 0;
     thread::scope(|s| {
         let num_workers = usize::from(thread::available_parallelism()?);
         let (blob_tx, blob_rx) = sync_channel::<Blob>(num_workers);
@@ -212,23 +213,23 @@ fn build_covered_nodes<R: Read + Seek + Send>(
         // Consumer thread. Sorts a stream of node ids, which it
         // receives from the blob consumers over the channel `node_rx`,
         // into a temporary file.
-        num_nodes = write_sorted(node_rx, workdir, &tmp)?;
+        num_covered_nodes = write_u64_table(node_rx, workdir, &tmp)?;
         Ok(())
     })?;
 
     rename(&tmp, &out)?;
-    bar.finish_with_message(format!("{} nodes", num_nodes));
+    bar.finish_with_message(format!("blobs → {} nodes", num_covered_nodes));
 
-    Ok(out)
+    Ok(U64Table::open(&out)?)
 }
 
 fn build_covered_ways<R: Read + Seek + Send>(
     reader: &mut BlobReader<R>,
     blobs: (usize, usize),
-    _covered_nodes: &Path,
+    covered_nodes: &U64Table,
     progress: &MultiProgress,
     workdir: &Path,
-) -> Result<PathBuf> {
+) -> Result<U64Table> {
     let out = workdir.join("covered-ways");
     if !out.exists() {
         log::info!("import_osm::build_covered_ways is starting");
@@ -237,19 +238,20 @@ fn build_covered_ways<R: Read + Seek + Send>(
             "skipping import_osm::build_covered_ways, already found {:?}",
             out
         );
-        return Ok(out);
+        return Ok(U64Table::open(&out)?);
     }
 
     let num_blobs = blobs.1 - blobs.0;
     let bar = Arc::new(progress.add(ProgressBar::new(num_blobs as u64)));
     bar.set_style(ProgressStyle::with_template(PROGRESS_BAR_STYLE)?);
     bar.set_prefix("osm.cov.w");
-    bar.set_message("pbf blobs");
+    bar.set_message("blobs");
 
     let mut tmp = out.clone();
     tmp.add_extension("tmp");
 
     let num_workers = usize::from(thread::available_parallelism()?);
+    let mut num_covered_ways = 0;
     thread::scope(|s| {
         let (blob_tx, blob_rx) = sync_channel::<Blob>(num_workers);
         let (way_tx, way_rx) = sync_channel::<u64>(num_workers * 1024);
@@ -271,12 +273,20 @@ fn build_covered_ways<R: Read + Seek + Send>(
         // consumer thread.
         s.spawn(move || {
             blob_rx.into_iter().par_bridge().try_for_each(|blob| {
-                let _way_tx = way_tx.clone();
                 let data = blob.into_data(); // decompress
                 let block = PrimitiveBlock::parse(&data);
                 for primitive in block.primitives() {
-                    if let Primitive::Way(_way) = primitive {
-                        // TODO: Implement.
+                    if let Primitive::Way(way) = primitive {
+                        let mut is_covered = false;
+                        for node in way.refs() {
+                            if node >= 0 && covered_nodes.contains(node as u64) {
+                                is_covered = true;
+                                break;
+                            }
+                        }
+                        if is_covered {
+                            way_tx.send(way.id)?;
+                        }
                     }
                 }
                 Ok(())
@@ -287,20 +297,21 @@ fn build_covered_ways<R: Read + Seek + Send>(
         // Consumer thread. Sorts a stream of way ids, which it
         // receives from the blob consumers over the channel `way_rx`,
         // into a temporary file.
-        write_sorted(way_rx, workdir, &tmp)
+        num_covered_ways = write_u64_table(way_rx, workdir, &tmp)?;
+        Ok(())
     })?;
 
     rename(&tmp, &out)?;
-    bar.finish_with_message("0 ways (not yet implemented)");
-    Ok(out)
+    bar.finish_with_message(format!("blobs → {} ways", num_covered_ways));
+    Ok(U64Table::open(&out)?)
 }
 
 fn build_covered_relations<R: Read + Seek + Send>(
     reader: &mut BlobReader<R>,
     blobs: (usize, usize),
-    _covered_nodes: &Path,
-    _covered_ways: &Path,
-    _relations_graph: &HashMap<u64, u64>,
+    covered_nodes: &U64Table,
+    covered_ways: &U64Table,
+    _relations_graph: &HashMap<u64, u64>, // TODO: Handle recursive relations.
     progress: &MultiProgress,
     workdir: &Path,
 ) -> Result<PathBuf> {
@@ -322,9 +333,10 @@ fn build_covered_relations<R: Read + Seek + Send>(
     let bar = Arc::new(progress.add(ProgressBar::new(num_blobs as u64)));
     bar.set_style(ProgressStyle::with_template(PROGRESS_BAR_STYLE)?);
     bar.set_prefix("osm.cov.r");
-    bar.set_message("pbf blobs");
+    bar.set_message("blobs");
 
     let num_workers = usize::from(thread::available_parallelism()?);
+    let mut num_relations = 0;
     thread::scope(|s| {
         let (blob_tx, blob_rx) = sync_channel::<Blob>(num_workers);
         let (rel_tx, rel_rx) = sync_channel::<u64>(num_workers * 1024);
@@ -346,12 +358,31 @@ fn build_covered_relations<R: Read + Seek + Send>(
         // relation ID is sent to the relation consumer thread.
         s.spawn(move || {
             blob_rx.into_iter().par_bridge().try_for_each(|blob| {
-                let _rel_tx = rel_tx.clone();
                 let data = blob.into_data(); // decompress
                 let block = PrimitiveBlock::parse(&data);
                 for primitive in block.primitives() {
-                    if let Primitive::Relation(_rel) = primitive {
-                        // TODO: Implement.
+                    if let Primitive::Relation(rel) = primitive {
+                        let mut is_covered = false;
+                        for (_, member_id, member_type) in rel.members() {
+                            match member_type {
+                                RelationMemberType::Node => {
+                                    if covered_nodes.contains(member_id) {
+                                        is_covered = true;
+                                        break;
+                                    }
+                                }
+                                RelationMemberType::Way => {
+                                    if covered_ways.contains(member_id) {
+                                        is_covered = true;
+                                        break;
+                                    }
+                                }
+                                RelationMemberType::Relation => {}
+                            }
+                        }
+                        if is_covered {
+                            rel_tx.send(rel.id)?;
+                        }
                     }
                 }
                 Ok(())
@@ -362,11 +393,12 @@ fn build_covered_relations<R: Read + Seek + Send>(
         // Consumer thread. Sorts a stream of relation ids, which it
         // receives from the blob consumers over the channel `rel_rx`,
         // into a temporary file.
-        write_sorted(rel_rx, workdir, &tmp)
+        num_relations = write_u64_table(rel_rx, workdir, &tmp)?;
+        Ok(())
     })?;
 
     rename(&tmp, &out)?;
-    bar.finish_with_message("0 relations (not yet implemented)");
+    bar.finish_with_message(format!("blobs → {} relations", num_relations));
     Ok(out)
 }
 

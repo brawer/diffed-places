@@ -28,18 +28,19 @@ mod reader {
     use std::fs::File;
     use std::path::Path;
 
-    #[allow(dead_code)] // TODO: Remove attribute once we use this struct.
-    pub struct Coverage {
+    #[allow(dead_code)]
+    pub struct Coverage<'a> {
         file: File,
         mmap: Mmap,
 
         num_runs: usize,
-        run_starts_offset: usize,
-        run_lengths_offset: usize,
+        run_starts_offset: usize, // TODO: Replace by `run_starts: &'a [u64]`.
+        run_lengths_offset: usize, // TODO: Replace by `run_lengths: &'a [u8]`.
+
+        wikidata_ids: &'a [u64],
     }
 
-    impl Coverage {
-        #[allow(dead_code)] // TODO: Remove attribute once we use this function.
+    impl<'a> Coverage<'a> {
         pub fn is_covering(&self, cell: &CellID) -> bool {
             // SAFETY: Alignment and bounds already checked by get_offset_size().
             let run_starts = unsafe {
@@ -62,7 +63,18 @@ mod reader {
             }
         }
 
-        pub fn load(path: &Path) -> Result<Coverage> {
+        #[allow(dead_code)] // TODO: Remove attribute once we use this function.
+        pub fn contains_wikidata_id(&self, id: u64) -> bool {
+            if cfg!(target_endian = "little") {
+                self.wikidata_ids.binary_search(&id).is_ok()
+            } else {
+                self.wikidata_ids
+                    .binary_search_by(|x| x.swap_bytes().cmp(&id))
+                    .is_ok()
+            }
+        }
+
+        pub fn load(path: &Path) -> Result<Coverage<'_>> {
             let file = File::open(path)?;
 
             // SAFETY: No other process writes to the file while we read it.
@@ -80,12 +92,21 @@ mod reader {
             }
             let num_runs = run_lengths_size;
 
+            let (wikidata_offset, wikidata_size) = Self::get_offset_size(b"wikidata", &mmap, 8)
+                .ok_or(anyhow!("no \"wikidata\" in coverage file {:?}", path))?;
+            // SAFETY: Alignment and bounds checked by get_offset_size().
+            let wikidata_ids = unsafe {
+                let ptr = mmap.as_ptr().add(wikidata_offset) as *const u64;
+                std::slice::from_raw_parts(ptr, wikidata_size / 8)
+            };
+
             Ok(Coverage {
                 file,
                 mmap,
                 num_runs,
                 run_starts_offset,
                 run_lengths_offset,
+                wikidata_ids,
             })
         }
 
@@ -98,8 +119,8 @@ mod reader {
 
         // This implementation only works on 64-bit processors. Theoretically,
         // we could write a special implementation for 32-bit platforms, which
-        // would either have to restrict its input to files smaller than 4 GiB.
-        // However, since we’re not doing a retro-computing project, we’ll never
+        // would have to restrict its input to files smaller than 4 GiB.
+        // However, we’re not doing a retro-computing project, so we’ll never
         // execute our code on such machines.
         #[cfg(target_pointer_width = "64")]
         fn get_offset_size(id: &[u8; 8], bytes: &[u8], alignment: usize) -> Option<(usize, usize)> {
@@ -201,6 +222,7 @@ mod writer {
     use parquet::record::RowAccessor;
     use parquet::schema::types::Type;
     use rayon::prelude::*;
+    use regex::Regex;
     use s2::{
         cap::Cap,
         cell::Cell,
@@ -208,7 +230,9 @@ mod writer {
         region::RegionCoverer,
         s1::{Angle, ChordAngle},
     };
+    use std::collections::HashSet;
     use std::fs::{File, remove_file, rename};
+    use std::hash::{BuildHasherDefault, Hasher};
     use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -218,38 +242,58 @@ mod writer {
     pub fn build_coverage(atp: &Path, progress: &MultiProgress, workdir: &Path) -> Result<PathBuf> {
         assert!(atp.exists());
 
-        let out_path = workdir.join("coverage");
-        if out_path.exists() {
-            log::info!("skipping build_coverage, already found {:?}", out_path);
-            return Ok(out_path);
+        let out = workdir.join("coverage");
+        if out.exists() {
+            log::info!("skipping build_coverage, already found {:?}", out);
+            return Ok(out);
         } else {
             log::info!("build_coverage is starting");
         }
 
+        let mut tmp = PathBuf::from(&out);
+        tmp.add_extension("tmp");
+        let mut writer = CoverageWriter::try_new(&tmp)?;
+
         // To avoid deadlock, we must not use Rayon threads here.
         // https://dev.to/sgchris/scoped-threads-with-stdthreadscope-in-rust-163-48f9
-        let (tx, rx) = sync_channel(50_000);
+        let (cell_tx, cell_rx) = sync_channel::<CellID>(50_000);
+        let (wikidata_tx, wikidata_rx) = sync_channel::<u64>(1000);
+
+        // The AllThePlaces dump of 2026-01-03 references 3791 unique wikidata ids.
+        let mut wikidata_ids = Vec::<u64>::new();
         std::thread::scope(|s| {
-            let producer = s.spawn(|| read_places(atp, progress, tx));
-            let consumer = s.spawn(|| build_spatial_coverage(rx, progress, &out_path));
-            producer.join().unwrap().and(consumer.join().unwrap())
+            let producer = s.spawn(|| read_places(atp, progress, cell_tx, wikidata_tx));
+            let cell_consumer = s.spawn(|| build_spatial_coverage(cell_rx, progress, &mut writer));
+            let wikidata_consumer = s.spawn(|| {
+                wikidata_ids = collect_wikidata_ids(wikidata_rx);
+                Ok(())
+            });
+            producer
+                .join()
+                .expect("producer panic")
+                .and(cell_consumer.join().expect("cell consumer panic"))
+                .and(wikidata_consumer.join().expect("wikidata consumer panic"))
         })?;
+
+        writer.set_wikidata_ids(wikidata_ids);
+        writer.close()?;
+        rename(&tmp, &out)?;
 
         // As a sanity check, let’s try to open the freshly generated file.
         // This verifies the presence of the correct file signature, and that
         // the run_starts and run_lengths array are correctly aligned and
         // within allowable bounds.
-        _ = Coverage::load(&out_path)?;
+        _ = Coverage::load(&out)?;
 
-        log::info!("build_spatial_coverage finished, built {:?}", out_path);
-
-        Ok(out_path)
+        log::info!("build_spatial_coverage finished, built {:?}", out);
+        Ok(out)
     }
 
     fn read_places(
         places: &Path,
         progress: &MultiProgress,
-        covering: SyncSender<CellID>,
+        out_cells: SyncSender<CellID>,
+        out_wikidata_ids: SyncSender<u64>,
     ) -> Result<()> {
         use anyhow::Context;
         let file =
@@ -273,6 +317,8 @@ mod writer {
             max_level: S2_GRANULARITY_LEVEL,
             level_mod: 1,
         };
+
+        let wikidata_regex = Regex::new(r"[Qq]\d+")?;
 
         let bar = progress.add(ProgressBar::new(num_rows));
         bar.set_style(ProgressStyle::with_template(PROGRESS_BAR_STYLE)?);
@@ -312,11 +358,20 @@ mod writer {
                                 ("railway", "platform") => large_radius,
                                 (_, _) => small_radius,
                             });
+                            if key == "wikidata" || key.ends_with(":wikidata") {
+                                for id in wikidata_regex.find_iter(value).map(|m| {
+                                    m.as_str()[1..].parse::<u64>().unwrap_or_else(|_| {
+                                        panic!("regex captured non-digits in \"{}\"", m.as_str())
+                                    })
+                                }) {
+                                    out_wikidata_ids.send(id)?;
+                                }
+                            }
                         }
                     }
                     let cap = Cap::from_center_chordangle(&s2_cell.center(), &radius);
                     for cell_id in coverer.covering(&cap).0.into_iter() {
-                        covering.send(cell_id)?;
+                        out_cells.send(cell_id)?;
                     }
                     bar.inc(1);
                 }
@@ -347,12 +402,8 @@ mod writer {
     fn build_spatial_coverage(
         cells: Receiver<CellID>,
         progress: &MultiProgress,
-        out: &Path,
+        writer: &mut CoverageWriter,
     ) -> Result<()> {
-        let mut tmp = PathBuf::from(out);
-        tmp.add_extension("tmp");
-
-        let mut writer = CoverageWriter::try_new(&tmp)?;
         let num_cells = AtomicU64::new(0);
         let sorter: ExternalSorter<CellID, std::io::Error, LimitedBufferBuilder> =
             ExternalSorterBuilder::new()
@@ -376,11 +427,25 @@ mod writer {
             bar.inc(1);
         }
 
-        writer.close()?;
-        rename(&tmp, out)?;
         bar.finish();
 
         Ok(())
+    }
+
+    fn collect_wikidata_ids(stream: Receiver<u64>) -> Vec<u64> {
+        // The AllThePlaces dump of 2026-01-03 references 3791 unique wikidata ids.
+        let mut ids = HashSet::with_capacity_and_hasher(8192, NoOpBuildHasher::default());
+        let mut last: u64 = 0; // not a valid wikidata id
+        for id in stream {
+            if id != last {
+                ids.insert(id);
+                last = id;
+            }
+        }
+
+        let mut sorted_ids: Vec<u64> = ids.into_iter().collect();
+        sorted_ids.sort();
+        sorted_ids
     }
 
     struct CoverageWriter {
@@ -394,10 +459,12 @@ mod writer {
         num_runs: u64,
         run_start: Option<u64>,
         run_length_minus_1: u8,
+
+        wikidata_ids: Vec<u64>,
     }
 
     impl CoverageWriter {
-        const NUM_HEADERS: usize = 2;
+        const NUM_HEADERS: usize = 3;
 
         fn try_new(path: &Path) -> Result<CoverageWriter> {
             let file = File::create(path)?;
@@ -422,6 +489,7 @@ mod writer {
                 num_runs: 0,
                 run_start: None,
                 run_length_minus_1: 0,
+                wikidata_ids: Vec::default(),
             })
         }
 
@@ -462,24 +530,43 @@ mod writer {
             Ok(())
         }
 
+        fn set_wikidata_ids(&mut self, ids: Vec<u64>) {
+            assert!(ids.is_sorted());
+            self.wikidata_ids = ids;
+        }
+
+        fn write_wikidata_ids(&mut self) -> Result<()> {
+            for id in &self.wikidata_ids {
+                self.writer.write_all(&id.to_le_bytes())?;
+            }
+            Ok(())
+        }
+
         fn close(mut self) -> Result<()> {
             self.finish_run()?;
             self.writer.flush()?;
 
             // Append the run lengths, which are at this point in time in a temporary file,
-            // to end end of the main file.
+            // to the end of the main file.
             let run_lengths_pos = self.writer.stream_position()?;
             self.run_lengths_writer.flush()?;
             assert_eq!(self.run_lengths_writer.stream_position()?, self.num_runs);
             self.run_lengths_writer.seek(SeekFrom::Start(0))?;
-
             let run_lengths_path: &Path = self.run_lengths_path.as_path();
             let mut reader = BufReader::new(File::open(run_lengths_path)?);
             std::io::copy(&mut reader, &mut self.writer)?;
             remove_file(run_lengths_path)?;
+
+            // Append wikidata ids.
+            self.write_padding(8)?;
+            let wikidata_ids_pos = self.writer.stream_position()?;
+            self.write_wikidata_ids()?;
+            let wikidata_ids_size = self.writer.stream_position()? - wikidata_ids_pos;
+
             self.write_headers(&[
                 ("runstart", self.run_starts_pos, self.num_runs * 8),
                 ("runlengt", run_lengths_pos, self.num_runs),
+                ("wikidata", wikidata_ids_pos, wikidata_ids_size),
             ])?;
             Ok(())
         }
@@ -511,7 +598,39 @@ mod writer {
                 .write_all(&[self.run_length_minus_1])?;
             Ok(())
         }
+
+        fn write_padding(&mut self, alignment: usize) -> Result<()> {
+            let pos = self.writer.stream_position()?;
+            let alignment = alignment as u64;
+            let num_bytes = ((alignment - (pos % alignment)) % alignment) as usize;
+            if num_bytes > 0 {
+                let padding = vec![0; num_bytes];
+                self.writer.write_all(&padding)?;
+            }
+            Ok(())
+        }
     }
+
+    #[derive(Default)]
+    struct NoOpHasher(u64);
+
+    impl Hasher for NoOpHasher {
+        fn write(&mut self, bytes: &[u8]) {
+            if let Some(value) = bytes.last() {
+                self.0 = *value as u64;
+            }
+        }
+
+        fn write_u64(&mut self, value: u64) {
+            self.0 = value;
+        }
+
+        fn finish(&self) -> u64 {
+            self.0
+        }
+    }
+
+    type NoOpBuildHasher = BuildHasherDefault<NoOpHasher>;
 
     #[cfg(test)]
     mod tests {
@@ -552,6 +671,7 @@ mod writer {
             for i in 1000..=1258 {
                 writer.write(i)?;
             }
+            writer.set_wikidata_ids(vec![23, 77, 88]);
             writer.close()?;
 
             let cov = Coverage::load(temp_file.path())?;
@@ -574,7 +694,25 @@ mod writer {
                 );
             }
 
+            assert_eq!(cov.contains_wikidata_id(1), false);
+            assert_eq!(cov.contains_wikidata_id(23), true);
+            assert_eq!(cov.contains_wikidata_id(51), false);
+            assert_eq!(cov.contains_wikidata_id(77), true);
+            assert_eq!(cov.contains_wikidata_id(88), true);
+            assert_eq!(cov.contains_wikidata_id(89), false);
+
             Ok(())
         }
+    }
+
+    #[test]
+    fn test_no_op_hasher() {
+        let mut h = NoOpHasher(7);
+
+        h.write_u64(2600);
+        assert_eq!(h.finish(), 2600);
+
+        h.write(&[31, 33, 7]);
+        assert_eq!(h.finish(), 7);
     }
 }

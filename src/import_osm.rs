@@ -72,9 +72,9 @@ fn build_relations_graph<R: Read + Seek + Send>(
     thread::scope(|s| {
         let (blob_tx, blob_rx) = sync_channel::<Blob>(num_workers);
 
-        // Blob producer thread, I/O-bound.
+        // I/O-bound thread for reading blobs from local disk.
         let bar_clone = Arc::clone(&bar);
-        s.spawn(move || {
+        let reader_thread = s.spawn(move || {
             for i in blobs.0..blobs.1 {
                 let blob = reader.read_blob(i)?;
                 blob_tx.send(blob)?;
@@ -83,8 +83,8 @@ fn build_relations_graph<R: Read + Seek + Send>(
             Ok(())
         });
 
-        // Blob consumers, CPU-bound.
-        s.spawn(|| {
+        // CPU-bound to decompress and process blobs.
+        let handler_thread = s.spawn(|| {
             result = blob_rx
                 .into_iter()
                 .par_bridge()
@@ -115,7 +115,10 @@ fn build_relations_graph<R: Read + Seek + Send>(
             Ok(())
         });
 
-        Ok(())
+        reader_thread
+            .join()
+            .expect("panic in reader thread")
+            .and(handler_thread.join().expect("panic in handler thread"))
     })?;
 
     bar.finish_with_message(format!("{} graph edges", result.len()));
@@ -155,9 +158,9 @@ fn build_covered_nodes<R: Read + Seek + Send>(
         let (blob_tx, blob_rx) = sync_channel::<Blob>(num_workers);
         let (node_tx, node_rx) = sync_channel::<u64>(num_workers * 1024);
 
-        // Blob producer thread, I/O-bound.
+        // I/O-bound thread for reading blobs from local disk.
         let bar_clone = Arc::clone(&bar);
-        s.spawn(move || {
+        let reader_thread = s.spawn(move || {
             for i in blobs.0..blobs.1 {
                 let blob = reader.read_blob(i)?;
                 blob_tx.send(blob)?;
@@ -166,11 +169,9 @@ fn build_covered_nodes<R: Read + Seek + Send>(
             Ok(())
         });
 
-        // CPU-bound blob consumers (one for each CPU) concurrently
-        // read and decompress blobs.  For each node within the
-        // spatial coverage area, the node ID is sent to the node
-        // consumer thread.
-        s.spawn(move || {
+        // CPU-bound thread that decompresses and handles blobs.
+        // Maintains an internal thread pool via `rayon::par_bridge`.
+        let handler_thread = s.spawn(move || {
             blob_rx.into_iter().par_bridge().try_for_each(|blob| {
                 let node_tx = node_tx.clone();
                 let data = blob.into_data(); // decompress
@@ -189,11 +190,16 @@ fn build_covered_nodes<R: Read + Seek + Send>(
             Ok(())
         });
 
-        // Consumer thread. Sorts a stream of node ids, which it
-        // receives from the blob consumers over the channel `node_rx`,
-        // into a temporary file.
-        num_covered_nodes = crate::u64_table::create(node_rx, workdir, &tmp)?;
-        Ok(())
+        // Thread to sort node ids and write the table to the working directory.
+        let writer_thread = s.spawn(|| {
+            num_covered_nodes = crate::u64_table::create(node_rx, workdir, &tmp)?;
+            Ok(())
+        });
+        reader_thread
+            .join()
+            .expect("reader panic")
+            .and(handler_thread.join().expect("handler panic"))
+            .and(writer_thread.join().expect("writer panic"))
     })?;
 
     rename(&tmp, &out)?;
@@ -235,9 +241,9 @@ fn build_covered_ways<R: Read + Seek + Send>(
         let (blob_tx, blob_rx) = sync_channel::<Blob>(num_workers);
         let (way_tx, way_rx) = sync_channel::<u64>(num_workers * 1024);
 
-        // Blob producer thread, I/O-bound.
+        // I/O-bound thread for reading blobs from local disk.
         let bar_clone = Arc::clone(&bar);
-        s.spawn(move || {
+        let reader_thread = s.spawn(move || {
             for i in blobs.0..blobs.1 {
                 let blob = reader.read_blob(i)?;
                 blob_tx.send(blob)?;
@@ -250,7 +256,7 @@ fn build_covered_ways<R: Read + Seek + Send>(
         // read and decompress blobs.  For each way that has at least one node
         // within the spatial coverage area, the way ID is sent to the way
         // consumer thread.
-        s.spawn(move || {
+        let handler_thread = s.spawn(move || {
             blob_rx.into_iter().par_bridge().try_for_each(|blob| {
                 let data = blob.into_data(); // decompress
                 let block = PrimitiveBlock::parse(&data);
@@ -273,11 +279,17 @@ fn build_covered_ways<R: Read + Seek + Send>(
             Ok(())
         });
 
-        // Consumer thread. Sorts a stream of way ids, which it
-        // receives from the blob consumers over the channel `way_rx`,
-        // into a temporary file.
-        num_covered_ways = crate::u64_table::create(way_rx, workdir, &tmp)?;
-        Ok(())
+        // Thread to sort way ids and write the resulting table to the working directory.
+        let writer_thread = s.spawn(|| {
+            num_covered_ways = crate::u64_table::create(way_rx, workdir, &tmp)?;
+            Ok(())
+        });
+
+        reader_thread
+            .join()
+            .expect("reader panic")
+            .and(handler_thread.join().expect("handler panic"))
+            .and(writer_thread.join().expect("writer panic"))
     })?;
 
     rename(&tmp, &out)?;
@@ -320,9 +332,9 @@ fn build_covered_relations<R: Read + Seek + Send>(
         let (blob_tx, blob_rx) = sync_channel::<Blob>(num_workers);
         let (rel_tx, rel_rx) = sync_channel::<u64>(num_workers * 1024);
 
-        // Blob producer thread, I/O-bound.
+        // I/O-bound thread for reading blobs from local disk.
         let bar_clone = Arc::clone(&bar);
-        s.spawn(move || {
+        let reader_thread = s.spawn(move || {
             for i in blobs.0..blobs.1 {
                 let blob = reader.read_blob(i)?;
                 blob_tx.send(blob)?;
@@ -335,7 +347,7 @@ fn build_covered_relations<R: Read + Seek + Send>(
         // read and decompress blobs.  For each relation that has at
         // least one node or way within the spatial coverage area, the
         // relation ID is sent to the relation consumer thread.
-        s.spawn(move || {
+        let handler_thread = s.spawn(move || {
             blob_rx.into_iter().par_bridge().try_for_each(|blob| {
                 let data = blob.into_data(); // decompress
                 let block = PrimitiveBlock::parse(&data);
@@ -369,11 +381,17 @@ fn build_covered_relations<R: Read + Seek + Send>(
             Ok(())
         });
 
-        // Consumer thread. Sorts a stream of relation ids, which it
-        // receives from the blob consumers over the channel `rel_rx`,
-        // into a temporary file.
-        num_relations = crate::u64_table::create(rel_rx, workdir, &tmp)?;
-        Ok(())
+        // Thread to sort way ids and write the resulting table to the working directory.
+        let writer_thread = s.spawn(|| {
+            num_relations = crate::u64_table::create(rel_rx, workdir, &tmp)?;
+            Ok(())
+        });
+
+        reader_thread
+            .join()
+            .expect("reader panic")
+            .and(handler_thread.join().expect("handler panic"))
+            .and(writer_thread.join().expect("writer panic"))
     })?;
 
     rename(&tmp, &out)?;

@@ -28,43 +28,40 @@ mod reader {
     use std::fs::File;
     use std::path::Path;
 
-    #[allow(dead_code)]
     pub struct Coverage<'a> {
-        file: File,
-        mmap: Mmap,
+        /// Backing store for `mmap`.
+        _file: File,
 
-        num_runs: usize,
-        run_starts_offset: usize, // TODO: Replace by `run_starts: &'a [u64]`.
-        run_lengths_offset: usize, // TODO: Replace by `run_lengths: &'a [u8]`.
+        /// Backing store for `run_starts`, `run_lengths` and `wikidata_ids`.
+        _mmap: Mmap,
 
+        /// Run-length encoded s2 cell ids, shifted by S2_CELL_ID_SHIFT.
+        run_starts: &'a [u64],
+        run_lengths: &'a [u8],
+
+        /// Sorted array of covered wikidata ids.
         wikidata_ids: &'a [u64],
     }
 
     impl<'a> Coverage<'a> {
-        pub fn is_covering(&self, cell: &CellID) -> bool {
-            // SAFETY: Alignment and bounds already checked by get_offset_size().
-            let run_starts = unsafe {
-                let ptr = self.mmap.as_ptr().add(self.run_starts_offset) as *const u64;
-                std::slice::from_raw_parts(ptr, self.num_runs)
-            };
-
-            let value: u64 = cell.0 >> S2_CELL_ID_SHIFT;
+        pub fn contains_s2_cell(&self, cell: &CellID) -> bool {
+            let val: u64 = cell.0 >> S2_CELL_ID_SHIFT;
             let index = if cfg!(target_endian = "little") {
-                run_starts.partition_point(|&start| start <= value)
+                self.run_starts.partition_point(|&x| x <= val)
             } else {
-                run_starts.partition_point(|&start| start.swap_bytes() <= value)
+                self.run_starts.partition_point(|&x| x.swap_bytes() <= val)
             };
             if index > 0 {
-                let start = run_starts[index - 1];
-                let limit = start + self.mmap[self.run_lengths_offset + index - 1] as u64;
-                start <= value && value <= limit
+                let start = self.run_starts[index - 1];
+                let limit = start + self.run_lengths[index - 1] as u64;
+                start <= val && val <= limit
             } else {
                 false
             }
         }
 
         #[allow(dead_code)] // TODO: Remove attribute once we use this function.
-        pub fn contains_wikidata_id(&self, id: u64) -> bool {
+        pub fn contains_wikidata_item(&self, id: u64) -> bool {
             if cfg!(target_endian = "little") {
                 self.wikidata_ids.binary_search(&id).is_ok()
             } else {
@@ -77,35 +74,47 @@ mod reader {
         pub fn load(path: &Path) -> Result<Coverage<'_>> {
             let file = File::open(path)?;
 
-            // SAFETY: No other process writes to the file while we read it.
+            // SAFETY: We don’t truncate the file while it’s mapped into memory.
             let mmap = unsafe { Mmap::map(&file)? };
 
             Self::check_signature(&mmap)?;
 
-            let (run_starts_offset, run_starts_size) = Self::get_offset_size(b"runstart", &mmap, 8)
-                .ok_or(anyhow!("no \"runstart\" in coverage file {:?}", path))?;
-            let (run_lengths_offset, run_lengths_size) =
-                Self::get_offset_size(b"runlengt", &mmap, 1)
-                    .ok_or(anyhow!("no \"runlengt\" in coverage file {:?}", path))?;
-            if run_starts_size != run_lengths_size * 8 {
+            let run_starts = {
+                let (offset, size) = Self::get_offset_size(b"runstart", &mmap, 8)
+                    .ok_or(anyhow!("no run starts in coverage file {:?}", path))?;
+                // SAFETY: Alignment and bounds checked by get_offset_size().
+                unsafe {
+                    let ptr = mmap.as_ptr().add(offset) as *const u64;
+                    std::slice::from_raw_parts(ptr, size / 8)
+                }
+            };
+
+            let run_lengths = {
+                let (offset, size) = Self::get_offset_size(b"runlengt", &mmap, 1)
+                    .ok_or(anyhow!("no run lengths in coverage file {:?}", path))?;
+                // SAFETY: Bounds checked by get_offset_size().
+                unsafe { std::slice::from_raw_parts(mmap.as_ptr().add(offset), size) }
+            };
+
+            if run_starts.len() != run_lengths.len() {
                 return Err(anyhow!("inconsistent number of runs in {:?}", path));
             }
-            let num_runs = run_lengths_size;
 
-            let (wikidata_offset, wikidata_size) = Self::get_offset_size(b"wikidata", &mmap, 8)
-                .ok_or(anyhow!("no \"wikidata\" in coverage file {:?}", path))?;
-            // SAFETY: Alignment and bounds checked by get_offset_size().
-            let wikidata_ids = unsafe {
-                let ptr = mmap.as_ptr().add(wikidata_offset) as *const u64;
-                std::slice::from_raw_parts(ptr, wikidata_size / 8)
+            let wikidata_ids = {
+                let (offset, size) = Self::get_offset_size(b"wikidata", &mmap, 8)
+                    .ok_or(anyhow!("no wikidata ids in coverage file {:?}", path))?;
+                // SAFETY: Alignment and bounds checked by get_offset_size().
+                unsafe {
+                    let ptr = mmap.as_ptr().add(offset) as *const u64;
+                    std::slice::from_raw_parts(ptr, size / 8)
+                }
             };
 
             Ok(Coverage {
-                file,
-                mmap,
-                num_runs,
-                run_starts_offset,
-                run_lengths_offset,
+                _file: file,
+                _mmap: mmap,
+                run_starts,
+                run_lengths,
                 wikidata_ids,
             })
         }
@@ -678,7 +687,7 @@ mod writer {
             for i in &[0, 5, 6, 8, 9, 999, 1259] {
                 let cell = CellID(i << S2_CELL_ID_SHIFT);
                 assert!(
-                    !cov.is_covering(&cell),
+                    !cov.contains_s2_cell(&cell),
                     "cell {:?} for i={} should not be covered, but is",
                     cell,
                     i,
@@ -687,19 +696,19 @@ mod writer {
             for i in &[7, 1000, 1001, 1002, 1111, 1254, 1255, 1256, 1257, 1258] {
                 let cell = CellID(i << S2_CELL_ID_SHIFT);
                 assert!(
-                    cov.is_covering(&cell),
+                    cov.contains_s2_cell(&cell),
                     "cell {:?} for i={} should be covered, but is not",
                     cell,
                     i,
                 );
             }
 
-            assert_eq!(cov.contains_wikidata_id(1), false);
-            assert_eq!(cov.contains_wikidata_id(23), true);
-            assert_eq!(cov.contains_wikidata_id(51), false);
-            assert_eq!(cov.contains_wikidata_id(77), true);
-            assert_eq!(cov.contains_wikidata_id(88), true);
-            assert_eq!(cov.contains_wikidata_id(89), false);
+            assert_eq!(cov.contains_wikidata_item(1), false);
+            assert_eq!(cov.contains_wikidata_item(23), true);
+            assert_eq!(cov.contains_wikidata_item(51), false);
+            assert_eq!(cov.contains_wikidata_item(77), true);
+            assert_eq!(cov.contains_wikidata_item(88), true);
+            assert_eq!(cov.contains_wikidata_item(89), false);
 
             Ok(())
         }

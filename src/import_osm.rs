@@ -179,7 +179,7 @@ fn build_covered_nodes<R: Read + Seek + Send>(
                     if let Primitive::Node(node) = primitive {
                         let s2_lat_lng = s2::latlng::LatLng::from_degrees(node.lat, node.lon);
                         let cell_id = s2::cellid::CellID::from(s2_lat_lng);
-                        if coverage.is_covering(&cell_id) {
+                        if coverage.contains_s2_cell(&cell_id) {
                             node_tx.send(node.id)?;
                         }
                     }

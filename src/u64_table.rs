@@ -120,13 +120,25 @@ mod writer {
         let sorted = sorter.sort(stream.into_iter().map(std::io::Result::Ok))?;
         let file = File::create(out)?;
         let mut writer = BufWriter::with_capacity(32768, file);
-        let mut num_values = 0;
+        let mut num_unique_values = 0;
+        let mut last: Option<u64> = None;
         for value in sorted {
-            writer.write_all(&value?.to_le_bytes())?;
-            num_values += 1;
+            let value = value?;
+            if let Some(last) = last
+                && last != value
+            {
+                writer.write_all(&last.to_le_bytes())?;
+                num_unique_values += 1;
+            }
+            last = Some(value);
         }
+        if let Some(last) = last {
+            writer.write_all(&last.to_le_bytes())?;
+            num_unique_values += 1;
+        }
+
         writer.flush()?;
-        Ok(num_values)
+        Ok(num_unique_values)
     }
 
     #[cfg(test)]
@@ -143,7 +155,9 @@ mod writer {
 
             tx.send(42)?;
             tx.send(23)?;
-            tx.send(77)?;
+            tx.send(23)?;
+            tx.send(7777)?;
+            tx.send(23)?;
             drop(tx);
 
             let num_written = super::create(
@@ -157,8 +171,43 @@ mod writer {
             assert_eq!(table.contains(4), false);
             assert_eq!(table.contains(23), true);
             assert_eq!(table.contains(42), true);
-            assert_eq!(table.contains(77), true);
+            assert_eq!(table.contains(7777), true);
             assert_eq!(table.contains(123), false);
+
+            Ok(())
+        }
+
+        #[test]
+        fn test_create_single_value() -> Result<()> {
+            let (tx, rx) = sync_channel::<u64>(10);
+            let tmp = tempfile::TempDir::new()?;
+            let out = tmp.path().join("test.u64_table");
+
+            tx.send(9)?;
+            drop(tx);
+
+            let num_written = super::create(rx, tmp.path(), &out)?;
+            assert_eq!(num_written, 1);
+
+            let table = U64Table::open(&out)?;
+            assert_eq!(table.contains(4), false);
+            assert_eq!(table.contains(9), true);
+
+            Ok(())
+        }
+
+        #[test]
+        fn test_create_empty() -> Result<()> {
+            let (tx, rx) = sync_channel::<u64>(10);
+            let tmp = tempfile::TempDir::new()?;
+            let out = tmp.path().join("test.u64_table");
+            drop(tx);
+
+            let num_written = super::create(rx, tmp.path(), &out)?;
+            assert_eq!(num_written, 0);
+
+            let table = U64Table::open(&out)?;
+            assert_eq!(table.contains(42), false);
 
             Ok(())
         }

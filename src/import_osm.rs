@@ -3,7 +3,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use osm_pbf_iter::{Blob, Primitive, PrimitiveBlock, RelationMemberType};
 use protobuf_iter::MessageIter;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, rename};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -37,7 +37,7 @@ pub fn import_osm(
     let coverage = Coverage::load(coverage)
         .with_context(|| format!("could not open coverage file `{:?}`", coverage))?;
 
-    let relations_graph = build_relations_graph(&mut reader, rel_blobs, progress)?;
+    let relation_parents = build_relation_parents(&mut reader, rel_blobs, progress)?;
 
     // Find which nodes, ways and relations lie within the coverage.
     let covered_nodes = build_covered_nodes(&mut reader, node_blobs, &coverage, progress, workdir)?;
@@ -48,7 +48,7 @@ pub fn import_osm(
         rel_blobs,
         &covered_nodes,
         &covered_ways,
-        &relations_graph,
+        &relation_parents,
         progress,
         workdir,
     )?;
@@ -56,7 +56,7 @@ pub fn import_osm(
     Ok(())
 }
 
-fn build_relations_graph<R: Read + Seek + Send>(
+fn build_relation_parents<R: Read + Seek + Send>(
     reader: &mut BlobReader<R>,
     blobs: (usize, usize),
     progress: &MultiProgress,
@@ -64,7 +64,7 @@ fn build_relations_graph<R: Read + Seek + Send>(
     let num_blobs = blobs.1 - blobs.0;
     let bar = Arc::new(progress.add(ProgressBar::new(num_blobs as u64)));
     bar.set_style(ProgressStyle::with_template(PROGRESS_BAR_STYLE)?);
-    bar.set_prefix("osm.grf.r");
+    bar.set_prefix("osm.prt.r");
     bar.set_message("blobs");
 
     let mut result = HashMap::<u64, u64>::new();
@@ -121,7 +121,7 @@ fn build_relations_graph<R: Read + Seek + Send>(
             .and(handler_thread.join().expect("panic in handler thread"))
     })?;
 
-    bar.finish_with_message(format!("{} graph edges", result.len()));
+    bar.finish_with_message(format!("blobs → {} relation parents", result.len()));
     Ok(result)
 }
 
@@ -302,7 +302,7 @@ fn build_covered_relations<R: Read + Seek + Send>(
     blobs: (usize, usize),
     covered_nodes: &U64Table,
     covered_ways: &U64Table,
-    _relations_graph: &HashMap<u64, u64>, // TODO: Handle recursive relations.
+    relation_parents: &HashMap<u64, u64>,
     progress: &MultiProgress,
     workdir: &Path,
 ) -> Result<PathBuf> {
@@ -372,7 +372,20 @@ fn build_covered_relations<R: Read + Seek + Send>(
                             }
                         }
                         if is_covered {
-                            rel_tx.send(rel.id)?;
+                            // If relation R is geographically within our coverage area,
+                            // so are its parents, grandparents, and any further ancestors.
+                            // In theory, the OpenStreetMap relation graph should be acyclic,
+                            // but in practice such cycles do occur. We break cycles while
+                            // walking the parent chain, so we don’t enter an infinite loop.
+                            //
+                            // With a coverage area derived from AllThePlaces as of 2026-01-03
+                            // and the OpenStreetMap planet dump of 2026-01-19, walking the
+                            // parent chain increases the yield of relations from 1947 to 2198.
+                            // Even though this is only a small quantitative difference,
+                            // we need to do this for correctness.
+                            for id in relation_parents.parent_chain(rel.id) {
+                                rel_tx.send(id)?;
+                            }
                         }
                     }
                 }
@@ -554,6 +567,52 @@ impl<'a, R: Read + Seek + Send> BlobReader<'a, R> {
     }
 }
 
+struct ParentChainIter<'a> {
+    parents: &'a HashMap<u64, u64>,
+    current: Option<u64>,
+    visited: HashSet<u64>,
+}
+
+impl<'a> ParentChainIter<'a> {
+    fn new(parents: &'a HashMap<u64, u64>, start: u64) -> Self {
+        ParentChainIter {
+            parents,
+            current: Some(start),
+            visited: HashSet::new(),
+        }
+    }
+}
+
+impl<'a> Iterator for ParentChainIter<'a> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.current?;
+
+        // Check for cycles.
+        if !self.visited.insert(current) {
+            // Cycle detected; stop iteration.
+            self.current = None;
+            return None;
+        }
+
+        // Look up the parent for next iteration.
+        self.current = self.parents.get(&current).copied();
+
+        Some(current)
+    }
+}
+
+trait ParentChainExt {
+    fn parent_chain<'a>(&'a self, start: u64) -> ParentChainIter<'a>;
+}
+
+impl ParentChainExt for HashMap<u64, u64> {
+    fn parent_chain<'a>(&'a self, start: u64) -> ParentChainIter<'a> {
+        ParentChainIter::new(self, start)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,5 +663,37 @@ mod tests {
         path.push("test_data");
         path.push(filename);
         path
+    }
+
+    #[test]
+    fn test_parent_chain() {
+        let mut g = HashMap::new();
+        g.insert(5, 23);
+        g.insert(23, 42);
+        g.insert(27, 42);
+        g.insert(42, 100);
+
+        let parent_chain = |i| g.parent_chain(i).collect::<Vec<u64>>();
+        assert_eq!(parent_chain(5), &[5, 23, 42, 100]);
+        assert_eq!(parent_chain(23), &[23, 42, 100]);
+        assert_eq!(parent_chain(27), &[27, 42, 100]);
+        assert_eq!(parent_chain(42), &[42, 100]);
+        assert_eq!(parent_chain(100), &[100]);
+        assert_eq!(parent_chain(9999), &[9999]);
+    }
+
+    #[test]
+    fn test_parent_chain_cycle() {
+        let mut g = HashMap::new();
+        g.insert(5, 23);
+        g.insert(23, 42);
+        g.insert(42, 100);
+        g.insert(100, 23);
+
+        let parent_chain = |i| g.parent_chain(i).collect::<Vec<u64>>();
+        assert_eq!(parent_chain(5), &[5, 23, 42, 100]);
+        assert_eq!(parent_chain(23), &[23, 42, 100]);
+        assert_eq!(parent_chain(42), &[42, 100, 23]);
+        assert_eq!(parent_chain(100), &[100, 23, 42]);
     }
 }

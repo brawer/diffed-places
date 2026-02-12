@@ -20,6 +20,41 @@ const S2_GRANULARITY_LEVEL: u8 = 19;
 /// level of granularity.
 const S2_CELL_ID_SHIFT: u8 = 64 - (3 + 2 * S2_GRANULARITY_LEVEL);
 
+pub fn is_wikidata_key(key: &str) -> bool {
+    key == "wikidata" || (key.ends_with(":wikidata") && key != "species:wikidata")
+}
+
+pub fn parse_wikidata_ids(input: &str) -> impl Iterator<Item = u64> + '_ {
+    input.split(';').filter_map(|part| {
+        let trimmed = part.trim();
+        let digits = trimmed
+            .strip_prefix('Q')
+            .or_else(|| trimmed.strip_prefix('q'))?;
+        digits.parse::<u64>().ok()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_wikidata_key, parse_wikidata_ids};
+
+    #[test]
+    fn test_is_wikidata_id() {
+        assert_eq!(is_wikidata_key("highway"), false);
+        assert_eq!(is_wikidata_key("wikidata"), true);
+        assert_eq!(is_wikidata_key("brand:wikidata"), true);
+        assert_eq!(is_wikidata_key("network:wikidata"), true);
+        assert_eq!(is_wikidata_key("operator:wikidata"), true);
+        assert_eq!(is_wikidata_key("species:wikidata"), false);
+    }
+
+    #[test]
+    fn test_parse_wikidata_ids() {
+        let ids: Vec<u64> = parse_wikidata_ids(" Q123;Q813 ; q21").collect();
+        assert_eq!(ids, vec![123, 813, 21]);
+    }
+}
+
 mod reader {
     use super::S2_CELL_ID_SHIFT;
     use anyhow::{Ok, Result, anyhow};
@@ -222,7 +257,9 @@ mod reader {
 }
 
 mod writer {
-    use super::{Coverage, S2_CELL_ID_SHIFT, S2_GRANULARITY_LEVEL};
+    use super::{
+        Coverage, S2_CELL_ID_SHIFT, S2_GRANULARITY_LEVEL, is_wikidata_key, parse_wikidata_ids,
+    };
     use crate::PROGRESS_BAR_STYLE;
     use anyhow::{Ok, Result, anyhow};
     use ext_sort::{ExternalSorter, ExternalSorterBuilder, buffer::LimitedBufferBuilder};
@@ -231,7 +268,6 @@ mod writer {
     use parquet::record::RowAccessor;
     use parquet::schema::types::Type;
     use rayon::prelude::*;
-    use regex::Regex;
     use s2::{
         cap::Cap,
         cell::Cell,
@@ -327,8 +363,6 @@ mod writer {
             level_mod: 1,
         };
 
-        let wikidata_regex = Regex::new(r"[Qq]\d+")?;
-
         let bar = progress.add(ProgressBar::new(num_rows));
         bar.set_style(ProgressStyle::with_template(PROGRESS_BAR_STYLE)?);
         bar.set_prefix("cov.read ");
@@ -367,12 +401,8 @@ mod writer {
                                 ("railway", "platform") => large_radius,
                                 (_, _) => small_radius,
                             });
-                            if key == "wikidata" || key.ends_with(":wikidata") {
-                                for id in wikidata_regex.find_iter(value).map(|m| {
-                                    m.as_str()[1..].parse::<u64>().unwrap_or_else(|_| {
-                                        panic!("regex captured non-digits in \"{}\"", m.as_str())
-                                    })
-                                }) {
+                            if is_wikidata_key(key) {
+                                for id in parse_wikidata_ids(value) {
                                     out_wikidata_ids.send(id)?;
                                 }
                             }

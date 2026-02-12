@@ -6,14 +6,16 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, rename};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread;
 
 use crate::PROGRESS_BAR_STYLE;
 use crate::coverage::Coverage;
 use crate::u64_table::U64Table;
+
+mod filter;
 
 pub fn import_osm(
     pbf: &Path,
@@ -43,7 +45,7 @@ pub fn import_osm(
     let covered_nodes = build_covered_nodes(&mut reader, node_blobs, &coverage, progress, workdir)?;
     let covered_ways =
         build_covered_ways(&mut reader, way_blobs, &covered_nodes, progress, workdir)?;
-    let _covered_relations = build_covered_relations(
+    let covered_relations = build_covered_relations(
         &mut reader,
         rel_blobs,
         &covered_nodes,
@@ -52,6 +54,64 @@ pub fn import_osm(
         progress,
         workdir,
     )?;
+
+    let _filtered_relations = filter::filter_relations(
+        &mut reader,
+        rel_blobs,
+        &coverage,
+        &covered_relations,
+        progress,
+        workdir,
+    );
+
+    let _filtered_ways = filter::filter_ways(
+        &mut reader,
+        way_blobs,
+        &coverage,
+        &covered_ways,
+        progress,
+        workdir,
+    );
+
+    let _filtered_nodes = filter::filter_nodes(
+        &mut reader,
+        node_blobs,
+        &coverage,
+        &covered_nodes,
+        progress,
+        workdir,
+    );
+
+    Ok(())
+}
+
+fn make_progress_bar(
+    progress: &MultiProgress,
+    phase: &str,
+    max_value: u64,
+    message: &str,
+) -> ProgressBar {
+    let bar = progress.add(ProgressBar::new(max_value));
+    bar.set_prefix(String::from(phase));
+    bar.set_message(String::from(message));
+
+    let style = ProgressStyle::with_template(PROGRESS_BAR_STYLE).expect("bad PROGRESS_BAR_STYLE");
+    bar.set_style(style);
+
+    bar
+}
+
+fn read_blobs<R: Read + Seek + Send>(
+    reader: &mut BlobReader<R>,
+    blobs: (usize, usize),
+    progress_bar: &ProgressBar,
+    out: SyncSender<Blob>,
+) -> Result<()> {
+    for i in blobs.0..blobs.1 {
+        let blob = reader.read_blob(i)?;
+        out.send(blob)?;
+        progress_bar.inc(1);
+    }
 
     Ok(())
 }
@@ -305,7 +365,7 @@ fn build_covered_relations<R: Read + Seek + Send>(
     relation_parents: &HashMap<u64, u64>,
     progress: &MultiProgress,
     workdir: &Path,
-) -> Result<PathBuf> {
+) -> Result<U64Table> {
     let out = workdir.join("covered-relations");
     if !out.exists() {
         log::info!("import_osm::build_covered_relations is starting");
@@ -314,7 +374,7 @@ fn build_covered_relations<R: Read + Seek + Send>(
             "skipping import_osm::build_covered_relations, already found {:?}",
             out
         );
-        return Ok(out);
+        return Ok(U64Table::open(&out)?);
     }
 
     let mut tmp = out.clone();
@@ -409,7 +469,7 @@ fn build_covered_relations<R: Read + Seek + Send>(
 
     rename(&tmp, &out)?;
     bar.finish_with_message(format!("blobs → {} relations", num_relations));
-    Ok(out)
+    Ok(U64Table::open(&out)?)
 }
 
 /// Reads data blobs from OpenStreetMap PBF files.

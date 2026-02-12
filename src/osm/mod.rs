@@ -121,30 +121,14 @@ fn build_relation_parents<R: Read + Seek + Send>(
     blobs: (usize, usize),
     progress: &MultiProgress,
 ) -> Result<HashMap<u64, u64>> {
-    let num_blobs = blobs.1 - blobs.0;
-    let bar = Arc::new(progress.add(ProgressBar::new(num_blobs as u64)));
-    bar.set_style(ProgressStyle::with_template(PROGRESS_BAR_STYLE)?);
-    bar.set_prefix("osm.prt.r");
-    bar.set_message("blobs");
-
+    let num_blobs = (blobs.1 - blobs.0) as u64;
+    let progress_bar = make_progress_bar(progress, "osm.prt.r", num_blobs, "blobs");
     let mut result = HashMap::<u64, u64>::new();
-    let num_workers = usize::from(thread::available_parallelism()?);
     thread::scope(|s| {
+        let num_workers = usize::from(thread::available_parallelism()?);
         let (blob_tx, blob_rx) = sync_channel::<Blob>(num_workers);
-
-        // I/O-bound thread for reading blobs from local disk.
-        let bar_clone = Arc::clone(&bar);
-        let reader_thread = s.spawn(move || {
-            for i in blobs.0..blobs.1 {
-                let blob = reader.read_blob(i)?;
-                blob_tx.send(blob)?;
-                bar_clone.inc(1);
-            }
-            Ok(())
-        });
-
-        // CPU-bound to decompress and process blobs.
-        let handler_thread = s.spawn(|| {
+        let producer = s.spawn(|| read_blobs(reader, blobs, &progress_bar, blob_tx));
+        let consumer = s.spawn(|| {
             result = blob_rx
                 .into_iter()
                 .par_bridge()
@@ -174,14 +158,13 @@ fn build_relation_parents<R: Read + Seek + Send>(
                 )?;
             Ok(())
         });
-
-        reader_thread
+        producer
             .join()
-            .expect("panic in reader thread")
-            .and(handler_thread.join().expect("panic in handler thread"))
+            .expect("panic in producer thread")
+            .and(consumer.join().expect("panic in consumer thread"))
     })?;
 
-    bar.finish_with_message(format!("blobs → {} relation parents", result.len()));
+    progress_bar.finish_with_message(format!("blobs → {} relation parents", result.len()));
     Ok(result)
 }
 

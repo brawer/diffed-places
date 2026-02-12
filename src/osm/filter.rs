@@ -1,7 +1,7 @@
 use super::BlobReader;
 use anyhow::{Ok, Result};
 use indicatif::MultiProgress;
-use osm_pbf_iter::{Blob, Primitive, PrimitiveBlock, tags::TagsIter};
+use osm_pbf_iter::{Blob, Primitive, PrimitiveBlock};
 use rayon::prelude::*;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
@@ -139,8 +139,8 @@ pub fn filter_ways<R: Read + Seek + Send>(
 pub fn filter_nodes<R: Read + Seek + Send>(
     reader: &mut BlobReader<R>,
     blobs: (usize, usize),
-    _coverage: &Coverage,
-    _covered_nodes: &U64Table,
+    coverage: &Coverage,
+    covered_nodes: &U64Table,
     progress: &MultiProgress,
     workdir: &Path,
 ) -> Result<PathBuf> {
@@ -163,9 +163,8 @@ pub fn filter_nodes<R: Read + Seek + Send>(
                 let data = blob.into_data(); // decompress
                 let block = PrimitiveBlock::parse(&data);
                 for primitive in block.primitives() {
-                    // TODO: Blocked on https://github.com/astro/rust-osm-pbf-iter/issues/33.
                     if let Primitive::Node(node) = primitive
-                        && false
+                        && filter(node.id, node.tags.iter().copied(), covered_nodes, coverage)
                     {
                         node_tx.send(Node { _id: node.id })?;
                     }
@@ -191,7 +190,10 @@ pub fn filter_nodes<R: Read + Seek + Send>(
     Ok(out)
 }
 
-fn filter(id: u64, tags: TagsIter, covered_ids: &U64Table, coverage: &Coverage) -> bool {
+fn filter<'a, I>(id: u64, tags: I, covered_ids: &U64Table, coverage: &Coverage) -> bool
+where
+    I: Iterator<Item = (&'a str, &'a str)>,
+{
     let mut has_any_tags = false;
     for (key, value) in tags {
         has_any_tags = true;

@@ -60,8 +60,7 @@ pub fn filter_relations<R: Read + Seek + Send>(
                     }
                 }
                 Ok(())
-            })?;
-            Ok(())
+            })
         });
         let consumer = s.spawn(|| {
             for _rel in rel_rx {
@@ -118,8 +117,7 @@ pub fn filter_ways<R: Read + Seek + Send>(
                     }
                 }
                 Ok(())
-            })?;
-            Ok(())
+            })
         });
         let consumer = s.spawn(|| {
             for _way in way_rx {
@@ -172,8 +170,7 @@ pub fn filter_nodes<R: Read + Seek + Send>(
                     }
                 }
                 Ok(())
-            })?;
-            Ok(())
+            })
         });
         let consumer = s.spawn(|| {
             for _node in node_rx {

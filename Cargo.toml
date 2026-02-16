@@ -17,7 +17,7 @@ geo-types = "0.7.18"
 geojson = "0.24.2"
 indicatif = { version = "0.18.3", default-features = false }
 log = { version = "0.4.29", default-features = false }
-memmap2 = "0.9.9"
+memmap2 = "0.9.10"
 osm_pbf_iter = { version = "0.2.1", default-features = false }
 parquet = { version = "57.3.0", default-features = false, features = ["arrow", "zstd"] }
 piz = "0.5.1"

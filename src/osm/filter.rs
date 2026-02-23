@@ -1,15 +1,14 @@
 use super::BlobReader;
+use crate::coverage::{Coverage, is_wikidata_key, parse_wikidata_ids};
+use crate::{u64_table, u64_table::U64Table};
 use anyhow::{Ok, Result};
 use indicatif::MultiProgress;
-use osm_pbf_iter::{Blob, Primitive, PrimitiveBlock};
+use osm_pbf_iter::{Blob, Primitive, PrimitiveBlock, RelationMemberType};
 use rayon::prelude::*;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
 use std::thread;
-
-use crate::coverage::{Coverage, is_wikidata_key, parse_wikidata_ids};
-use crate::u64_table::U64Table;
 
 struct Node {
     _id: u64,
@@ -39,13 +38,19 @@ pub fn filter_relations<R: Read + Seek + Send>(
         return Ok(out);
     }
 
+    let node_refs = workdir.join("node-refs-in-relations");
+    let way_refs = workdir.join("way-refs-in-relations");
     let num_blobs = (blobs.1 - blobs.0) as u64;
     let mut num_results = 0;
-    let progress_bar = super::make_progress_bar(progress, "osm.flt.r", num_blobs, "blobs");
+    let mut num_node_refs = 0;
+    let mut num_way_refs = 0;
+    let progress_bar = super::make_progress_bar(progress, "osm.filter.r", num_blobs, "blobs");
     thread::scope(|s| {
         let num_workers = usize::from(thread::available_parallelism()?);
         let (blob_tx, blob_rx) = sync_channel::<Blob>(num_workers);
         let (rel_tx, rel_rx) = sync_channel::<Relation>(1024);
+        let (node_ref_tx, node_ref_rx) = sync_channel::<u64>(8192);
+        let (way_ref_tx, way_ref_rx) = sync_channel::<u64>(8192);
         let producer = s.spawn(|| super::read_blobs(reader, blobs, &progress_bar, blob_tx));
         let handler = s.spawn(move || {
             blob_rx.into_iter().par_bridge().try_for_each(|blob| {
@@ -56,12 +61,34 @@ pub fn filter_relations<R: Read + Seek + Send>(
                     if let Primitive::Relation(rel) = primitive
                         && filter(rel.id, rel.tags(), covered_relations, coverage)
                     {
+                        for (_name, member_id, member_type) in rel.members() {
+                            match member_type {
+                                RelationMemberType::Node => {
+                                    node_ref_tx.send(member_id)?;
+                                }
+                                RelationMemberType::Way => {
+                                    way_ref_tx.send(member_id)?;
+                                }
+                                _ => {}
+                            }
+                        }
                         rel_tx.send(Relation { _id: rel.id })?;
                     }
                 }
                 Ok(())
             })
         });
+
+        let node_ref_writer = s.spawn(|| {
+            num_node_refs = u64_table::create(node_ref_rx, workdir, &node_refs)?;
+            Ok(())
+        });
+
+        let way_ref_writer = s.spawn(|| {
+            num_way_refs = u64_table::create(way_ref_rx, workdir, &way_refs)?;
+            Ok(())
+        });
+
         let consumer = s.spawn(|| {
             for _rel in rel_rx {
                 num_results += 1;
@@ -73,8 +100,21 @@ pub fn filter_relations<R: Read + Seek + Send>(
             .expect("panic in filter_relations producer")
             .and(handler.join().expect("panic in filter_relations handler"))
             .and(consumer.join().expect("panic in filter_relations consumer"))
+            .and(
+                node_ref_writer
+                    .join()
+                    .expect("panic in filter_ways node_ref_writer"),
+            )
+            .and(
+                way_ref_writer
+                    .join()
+                    .expect("panic in filter_ways way_ref_writer"),
+            )
     })?;
-    progress_bar.finish_with_message(format!("blobs → {} relations", num_results));
+    progress_bar.finish_with_message(format!(
+        "blobs → {} relations with {} nodes and {} ways",
+        num_results, num_node_refs, num_way_refs
+    ));
 
     Ok(out)
 }
@@ -92,13 +132,16 @@ pub fn filter_ways<R: Read + Seek + Send>(
         return Ok(out);
     }
 
+    let node_refs = workdir.join("node-refs-in-ways");
     let num_blobs = (blobs.1 - blobs.0) as u64;
     let mut num_results = 0;
-    let progress_bar = super::make_progress_bar(progress, "osm.flt.w", num_blobs, "blobs");
+    let mut num_node_refs = 0;
+    let progress_bar = super::make_progress_bar(progress, "osm.filter.w", num_blobs, "blobs");
     thread::scope(|s| {
         let num_workers = usize::from(thread::available_parallelism()?);
         let (blob_tx, blob_rx) = sync_channel::<Blob>(num_workers);
-        let (way_tx, way_rx) = sync_channel::<Way>(1024);
+        let (way_tx, way_rx) = sync_channel::<Way>(4096);
+        let (node_ref_tx, node_ref_rx) = sync_channel::<u64>(8192);
         let producer = s.spawn(|| super::read_blobs(reader, blobs, &progress_bar, blob_tx));
         let handler = s.spawn(move || {
             blob_rx.into_iter().par_bridge().try_for_each(|blob| {
@@ -109,7 +152,11 @@ pub fn filter_ways<R: Read + Seek + Send>(
                     if let Primitive::Way(way) = primitive
                         && filter(way.id, way.tags(), covered_ways, coverage)
                     {
-                        let nodes = way.refs().filter(|&x| x > 0).map(|x| x as u64).collect();
+                        let nodes: Vec<u64> =
+                            way.refs().filter(|&x| x > 0).map(|x| x as u64).collect();
+                        for n in nodes.iter() {
+                            node_ref_tx.send(*n)?;
+                        }
                         way_tx.send(Way {
                             _id: way.id,
                             _nodes: nodes,
@@ -119,6 +166,12 @@ pub fn filter_ways<R: Read + Seek + Send>(
                 Ok(())
             })
         });
+
+        let node_ref_writer = s.spawn(|| {
+            num_node_refs = u64_table::create(node_ref_rx, workdir, &node_refs)?;
+            Ok(())
+        });
+
         let consumer = s.spawn(|| {
             for _way in way_rx {
                 num_results += 1;
@@ -130,8 +183,16 @@ pub fn filter_ways<R: Read + Seek + Send>(
             .expect("panic in filter_ways producer")
             .and(handler.join().expect("panic in filter_ways handler"))
             .and(consumer.join().expect("panic in filter_ways consumer"))
+            .and(
+                node_ref_writer
+                    .join()
+                    .expect("panic in filter_ways node_resf_writer"),
+            )
     })?;
-    progress_bar.finish_with_message(format!("blobs → {} ways", num_results));
+    progress_bar.finish_with_message(format!(
+        "blobs → {} ways with {} nodes",
+        num_results, num_node_refs
+    ));
 
     Ok(out)
 }
@@ -151,7 +212,7 @@ pub fn filter_nodes<R: Read + Seek + Send>(
 
     let num_blobs = (blobs.1 - blobs.0) as u64;
     let mut num_results = 0;
-    let progress_bar = super::make_progress_bar(progress, "osm.flt.n", num_blobs, "blobs");
+    let progress_bar = super::make_progress_bar(progress, "osm.filter.n", num_blobs, "blobs");
     thread::scope(|s| {
         let num_workers = usize::from(thread::available_parallelism()?);
         let (blob_tx, blob_rx) = sync_channel::<Blob>(num_workers);

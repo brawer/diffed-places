@@ -44,4 +44,5 @@ jobs:
     - name: Look for common mistakes
       run: cargo clippy --locked
     - name: Upload test coverage to Coveralls
+      if: false  # coveralls.io down as of 2025-02-25
       uses: coverallsapp/github-action@648a8eb78e6d50909eff900e4ec85cab4524a45b  # v2.3.6

@@ -148,17 +148,13 @@ pub fn filter_relations<R: Read + Seek + Send>(
     // Assemble out output file "osm-filtered-relations" and clean up temporary intermediates.
     let mut tmp_out = PathBuf::from(&out_path);
     tmp_out.add_extension("tmp");
-    filtered_file::write(
-        None, // no nodes
-        None, // no ways
-        Some((
-            &filtered_rels_data_path,
-            &filtered_rels_offsets_path,
-            &node_refs_path,
-            &way_refs_path,
-        )),
-        &tmp_out,
-    )?;
+
+    let mut writer = filtered_file::Writer::create(&tmp_out)?;
+    writer.write_features(&filtered_rels_data_path, &filtered_rels_offsets_path)?;
+    writer.write_node_refs(&node_refs_path)?;
+    writer.write_way_refs(&way_refs_path)?;
+    writer.close()?;
+
     remove_file(&filtered_rels_data_path)?;
     remove_file(&filtered_rels_offsets_path)?;
     remove_file(&node_refs_path)?;
@@ -271,16 +267,12 @@ pub fn filter_ways<R: Read + Seek + Send>(
     // Other than writing/assembling the file piece by piece, renaming is an atomic operation.
     let mut tmp_out = PathBuf::from(&out_path);
     tmp_out.add_extension("tmp");
-    filtered_file::write(
-        None, // no nodes
-        Some((
-            &filtered_ways_data_path,
-            &filtered_ways_offsets_path,
-            &node_refs_path,
-        )),
-        None, // no relations
-        &tmp_out,
-    )?;
+
+    let mut writer = filtered_file::Writer::create(&tmp_out)?;
+    writer.write_features(&filtered_ways_data_path, &filtered_ways_offsets_path)?;
+    writer.write_node_refs(&node_refs_path)?;
+    writer.close()?;
+
     remove_file(&filtered_ways_data_path)?;
     remove_file(&filtered_ways_offsets_path)?;
     remove_file(&node_refs_path)?;
@@ -377,137 +369,88 @@ mod filtered_file {
     use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
     use std::path::Path;
 
-    const NUM_HEADERS: usize = 9;
     const BUFFER_SIZE: usize = 256 * 1024;
 
-    pub fn write(
-        nodes: Option<(&Path, &Path)>,
-        ways: Option<(&Path, &Path, &Path)>,
-        rels: Option<(&Path, &Path, &Path, &Path)>,
-        out: &Path,
-    ) -> Result<()> {
-        let mut writer = BufWriter::with_capacity(BUFFER_SIZE, File::create(out)?);
-
-        let (node_data, node_offsets) = if let Some((data, offsets)) = nodes {
-            (Some(data), Some(offsets))
-        } else {
-            (None, None)
-        };
-        let (way_data, way_offsets, way_node_refs) = if let Some((data, offsets, node_refs)) = ways
-        {
-            (Some(data), Some(offsets), Some(node_refs))
-        } else {
-            (None, None, None)
-        };
-        let (rel_data, rel_offsets, rel_node_refs, rel_way_refs) =
-            if let Some((data, offsets, node_refs, way_refs)) = rels {
-                (Some(data), Some(offsets), Some(node_refs), Some(way_refs))
-            } else {
-                (None, None, None, None)
-            };
-
-        // Reserve space for file header.
-        writer.write_all(b"diffed-places filtered\0\0")?;
-        writer.write_all(&(NUM_HEADERS as u64).to_le_bytes())?;
-        writer.write_all(&[0; 24 * NUM_HEADERS])?; // leave space for headers
-
-        // Write data.
-        let (node_data_start, node_data_len) =
-            write_data(node_data, /* align */ 1, &mut writer)?;
-        let (way_data_start, way_data_len) = write_data(way_data, /* align */ 1, &mut writer)?;
-        let (rel_data_start, rel_data_len) = write_data(rel_data, /* align */ 1, &mut writer)?;
-
-        // Write offsets into data.
-        let (node_offsets_start, node_offsets_len) =
-            write_data(node_offsets, /* align */ 8, &mut writer)?;
-        let (way_offsets_start, way_offsets_len) =
-            write_data(way_offsets, /* align */ 8, &mut writer)?;
-        let (rel_offsets_start, rel_offsets_len) =
-            write_data(rel_offsets, /* align */ 8, &mut writer)?;
-
-        // Write a table for telling which nodes are referenced by ways.
-        // The table is keyed by OpenStreetMap node ID, so it needs to be aligned for access as &[u64].
-        let (way_node_refs_start, way_node_refs_len) =
-            write_data(way_node_refs, /* align */ 8, &mut writer)?;
-
-        // Write tables for telling which nodes and ways are referenced by relations.
-        let (rel_node_refs_start, rel_node_refs_len) =
-            write_data(rel_node_refs, /* align */ 8, &mut writer)?;
-        let (rel_way_refs_start, rel_way_refs_len) =
-            write_data(rel_way_refs, /* align */ 8, &mut writer)?;
-
-        // Write file header.
-        write_headers(
-            &[
-                ("nod_data", node_data_start, node_data_len),
-                ("nod_offs", node_offsets_start, node_offsets_len),
-                ("way_data", way_data_start, way_data_len),
-                ("way_offs", way_offsets_start, way_offsets_len),
-                ("way_rf_n", way_node_refs_start, way_node_refs_len),
-                ("rel_data", rel_data_start, rel_data_len),
-                ("rel_offs", rel_offsets_start, rel_offsets_len),
-                ("rel_rf_n", rel_node_refs_start, rel_node_refs_len),
-                ("rel_rf_w", rel_way_refs_start, rel_way_refs_len),
-            ],
-            &mut writer,
-        )?;
-
-        writer.into_inner()?.sync_all()?;
-        Ok(())
+    pub struct Writer {
+        writer: BufWriter<File>,
+        headers: Vec<(&'static [u8; 8], u64, u64)>,
     }
 
-    fn append_file<W: Write + Seek>(file: &Path, out: &mut W) -> Result<u64> {
-        let mut reader = BufReader::with_capacity(BUFFER_SIZE, File::open(file)?);
-        std::io::copy(&mut reader, out)?;
-        Ok(reader.stream_position()?)
-    }
-
-    fn write_padding<W: Write + Seek>(alignment: usize, out: &mut W) -> Result<()> {
-        if alignment == 1 {
-            return Ok(());
+    impl Writer {
+        pub fn create(path: &Path) -> Result<Writer> {
+            let mut writer = BufWriter::with_capacity(BUFFER_SIZE, File::create(path)?);
+            // Reserve space for file header.
+            writer.write_all(b"diffed-places filtered\0\0")?;
+            writer.write_all(&[0; 8])?; // leave space to offset of header section
+            Ok(Writer {
+                writer,
+                headers: Vec::with_capacity(10),
+            })
         }
 
-        let pos = out.stream_position()?;
-        let alignment = alignment as u64;
-        let num_bytes = ((alignment - (pos % alignment)) % alignment) as usize;
-        if num_bytes > 0 {
-            let padding = vec![0; num_bytes];
-            out.write_all(&padding)?;
+        pub fn write_features(&mut self, data: &Path, offsets: &Path) -> Result<()> {
+            let (data_start, data_len) = self.write_file(data, /* alignment */ 1)?;
+            let (offsets_start, offsets_len) = self.write_file(offsets, /* alignment */ 8)?;
+            self.headers.push((b"fea_data", data_start, data_len));
+            self.headers.push((b"fea_offs", offsets_start, offsets_len));
+            Ok(())
         }
 
-        Ok(())
-    }
-
-    fn write_headers<W: Write + Seek>(headers: &[(&str, u64, u64)], out: &mut W) -> Result<()> {
-        out.seek(SeekFrom::Start(32))?;
-        assert_eq!(headers.len(), NUM_HEADERS);
-        for (id, pos, len) in headers {
-            assert_eq!(
-                id.len(),
-                8,
-                "header id must be 8 chars long but \"{:?}\" is not",
-                id
-            );
-            out.write_all(id.as_bytes())?;
-            out.write_all(&pos.to_le_bytes())?;
-            out.write_all(&len.to_le_bytes())?;
+        pub fn write_node_refs(&mut self, path: &Path) -> Result<()> {
+            let (start, len) = self.write_file(path, /* alignment */ 8)?;
+            self.headers.push((b"nod_refs", start, len));
+            Ok(())
         }
-        out.flush()?;
-        Ok(())
-    }
 
-    fn write_data<W: Write + Seek>(
-        data: Option<&Path>,
-        alignment: usize,
-        out: &mut W,
-    ) -> Result<(u64, u64)> {
-        if let Some(path) = data {
-            write_padding(alignment, out)?;
-            let start = out.stream_position()?;
-            let len = append_file(path, out)?;
+        pub fn write_way_refs(&mut self, path: &Path) -> Result<()> {
+            let (start, len) = self.write_file(path, /* alignment */ 8)?;
+            self.headers.push((b"way_refs", start, len));
+            Ok(())
+        }
+
+        pub fn close(mut self) -> Result<()> {
+            self.write_headers()?;
+            self.writer.flush()?;
+            Ok(())
+        }
+
+        fn write_headers(&mut self) -> Result<()> {
+            self.write_padding(/* alignment */ 8)?;
+            let header_pos = self.writer.stream_position()?;
+
+            let num_headers = self.headers.len() as u64;
+            self.writer.write_all(&num_headers.to_le_bytes())?;
+
+            for (id, pos, len) in self.headers.iter() {
+                self.writer.write_all(*id)?;
+                self.writer.write_all(&pos.to_le_bytes())?;
+                self.writer.write_all(&len.to_le_bytes())?;
+            }
+            self.writer.seek(SeekFrom::Start(24))?;
+            self.writer.write_all(&header_pos.to_le_bytes())?;
+            Ok(())
+        }
+
+        fn write_file(&mut self, path: &Path, alignment: usize) -> Result<(u64, u64)> {
+            self.write_padding(alignment)?;
+            let start = self.writer.stream_position()?;
+            let mut reader = BufReader::with_capacity(BUFFER_SIZE, File::open(path)?);
+            std::io::copy(&mut reader, &mut self.writer)?;
+            let len = reader.stream_position()?;
             Ok((start, len))
-        } else {
-            Ok((0, 0))
+        }
+
+        fn write_padding(&mut self, alignment: usize) -> Result<()> {
+            if alignment > 1 {
+                let pos = self.writer.stream_position()?;
+                let alignment = alignment as u64;
+                let num_bytes = ((alignment - (pos % alignment)) % alignment) as usize;
+                if num_bytes > 0 {
+                    let padding = vec![0; num_bytes];
+                    self.writer.write_all(&padding)?;
+                }
+            }
+            Ok(())
         }
     }
 }

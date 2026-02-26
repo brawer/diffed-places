@@ -95,7 +95,6 @@ mod reader {
             }
         }
 
-        #[allow(dead_code)] // TODO: Remove attribute once we use this function.
         pub fn contains_wikidata_item(&self, id: u64) -> bool {
             if cfg!(target_endian = "little") {
                 self.wikidata_ids.binary_search(&id).is_ok()

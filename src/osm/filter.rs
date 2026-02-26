@@ -12,8 +12,14 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
 use std::thread;
 
+use filtered_file::FilteredFile;
+
+#[derive(Deserialize, Serialize)]
 struct Node {
-    _id: u64,
+    id: u64,
+    tags: Vec<String>,
+    lon_e7: i32,
+    lat_e7: i32,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -31,17 +37,17 @@ struct Relation {
 
 // TODO: Handle recursive relations.
 // https://github.com/diffed-places/pipeline/issues/141
-pub fn filter_relations<R: Read + Seek + Send>(
+pub fn filter_relations<'a, R: Read + Seek + Send>(
     reader: &mut BlobReader<R>,
     blobs: (usize, usize),
     coverage: &Coverage,
     covered_relations: &U64Table,
     progress: &MultiProgress,
     workdir: &Path,
-) -> Result<PathBuf> {
+) -> Result<FilteredFile<'a>> {
     let out_path = workdir.join("osm-filtered-relations");
     if out_path.exists() {
-        return Ok(out_path);
+        return Ok(FilteredFile::open(&out_path)?);
     }
 
     let filtered_rels_data_path = workdir.join("osm-filtered-relations.data.tmp");
@@ -166,20 +172,21 @@ pub fn filter_relations<R: Read + Seek + Send>(
         num_relations, num_node_refs, num_way_refs
     ));
 
-    Ok(out_path)
+    Ok(FilteredFile::open(&out_path)?)
 }
 
-pub fn filter_ways<R: Read + Seek + Send>(
+pub fn filter_ways<'a, R: Read + Seek + Send>(
     reader: &mut BlobReader<R>,
     blobs: (usize, usize),
     coverage: &Coverage,
     covered_ways: &U64Table,
+    filtered_relations: &FilteredFile,
     progress: &MultiProgress,
     workdir: &Path,
-) -> Result<PathBuf> {
+) -> Result<FilteredFile<'a>> {
     let out_path = workdir.join("osm-filtered-ways");
     if out_path.exists() {
-        return Ok(out_path);
+        return Ok(FilteredFile::open(&out_path)?);
     }
 
     let filtered_ways_data_path = workdir.join("osm-filtered-ways.data.tmp");
@@ -197,29 +204,44 @@ pub fn filter_ways<R: Read + Seek + Send>(
         let (way_tx, way_rx) = sync_channel::<Way>(4096);
         let (node_ref_tx, node_ref_rx) = sync_channel::<u64>(8192);
         let producer = s.spawn(|| super::read_blobs(reader, blobs, &progress_bar, blob_tx));
+
         let handler = s.spawn(move || {
             blob_rx.into_iter().par_bridge().try_for_each(|blob| {
                 let way_tx = way_tx.clone();
                 let data = blob.into_data(); // decompress
                 let block = PrimitiveBlock::parse(&data);
                 for primitive in block.primitives() {
-                    if let Primitive::Way(way) = primitive
-                        && filter(way.id, way.tags(), covered_ways, coverage)
-                    {
-                        let nodes: Vec<u64> =
-                            way.refs().filter(|&x| x > 0).map(|x| x as u64).collect();
-                        let tags: Vec<String> = way
-                            .tags()
-                            .flat_map(|(k, v)| [k.to_string(), v.to_string()])
-                            .collect();
-                        for n in nodes.iter() {
-                            node_ref_tx.send(*n)?;
+                    if let Primitive::Way(way) = primitive {
+                        if filter(way.id, way.tags(), covered_ways, coverage) {
+                            let nodes = collect_way_nodes(&way);
+                            let tags: Vec<String> = way
+                                .tags()
+                                .flat_map(|(k, v)| [k.to_string(), v.to_string()])
+                                .collect();
+                            for n in nodes.iter() {
+                                node_ref_tx.send(*n)?;
+                            }
+                            way_tx.send(Way {
+                                id: way.id,
+                                nodes,
+                                tags,
+                            })?;
+                        } else if filtered_relations.has_way_ref(way.id) {
+                            // Also keep ways that aren't really “interesting” (relevant for our matching)
+                            // by themselves, but that are part of an “interesting” relation. We’ll use
+                            // such ways for constructing the relation’s geometry, so we need the coordinates
+                            // of the nodes belonging to such ways. However, we don’t need
+                            // the way’s tags since the way will not actually make it into our final output.
+                            let nodes = collect_way_nodes(&way);
+                            for n in nodes.iter() {
+                                node_ref_tx.send(*n)?;
+                            }
+                            way_tx.send(Way {
+                                id: way.id,
+                                nodes,
+                                tags: Vec::<String>::with_capacity(0),
+                            })?;
                         }
-                        way_tx.send(Way {
-                            id: way.id,
-                            nodes,
-                            tags,
-                        })?;
                     }
                 }
                 Ok(())
@@ -283,30 +305,41 @@ pub fn filter_ways<R: Read + Seek + Send>(
         num_ways, num_node_refs
     ));
 
-    Ok(out_path)
+    Ok(FilteredFile::open(&out_path)?)
 }
 
-pub fn filter_nodes<R: Read + Seek + Send>(
+/// Helper for `filter_ways()`.
+fn collect_way_nodes(way: &osm_pbf_iter::Way) -> Vec<u64> {
+    way.refs().filter(|&x| x > 0).map(|x| x as u64).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn filter_nodes<'a, R: Read + Seek + Send>(
     reader: &mut BlobReader<R>,
     blobs: (usize, usize),
     coverage: &Coverage,
     covered_nodes: &U64Table,
+    filtered_ways: &FilteredFile,
+    filtered_relations: &FilteredFile,
     progress: &MultiProgress,
     workdir: &Path,
-) -> Result<PathBuf> {
-    let out = workdir.join("osm-filtered-nodes");
-    if out.exists() {
-        return Ok(out);
+) -> Result<FilteredFile<'a>> {
+    let out_path = workdir.join("osm-filtered-nodes");
+    if out_path.exists() {
+        return Ok(FilteredFile::open(&out_path)?);
     }
 
+    let filtered_nodes_data_path = workdir.join("osm-filtered-nodes.data.tmp");
+    let filtered_nodes_offsets_path = workdir.join("osm-filtered-nodes.offsets.tmp");
+
     let num_blobs = (blobs.1 - blobs.0) as u64;
-    let mut num_results = 0;
+    let mut num_nodes = 0;
     let progress_bar =
         super::make_progress_bar(progress, "osm.filter.n", num_blobs, "blobs → nodes");
     thread::scope(|s| {
         let num_workers = usize::from(thread::available_parallelism()?);
         let (blob_tx, blob_rx) = sync_channel::<Blob>(num_workers);
-        let (node_tx, node_rx) = sync_channel::<Node>(1024);
+        let (node_tx, node_rx) = sync_channel::<Node>(2048);
         let producer = s.spawn(|| super::read_blobs(reader, blobs, &progress_bar, blob_tx));
         let handler = s.spawn(move || {
             blob_rx.into_iter().par_bridge().try_for_each(|blob| {
@@ -314,30 +347,92 @@ pub fn filter_nodes<R: Read + Seek + Send>(
                 let data = blob.into_data(); // decompress
                 let block = PrimitiveBlock::parse(&data);
                 for primitive in block.primitives() {
-                    if let Primitive::Node(node) = primitive
-                        && filter(node.id, node.tags.iter().copied(), covered_nodes, coverage)
-                    {
-                        node_tx.send(Node { _id: node.id })?;
+                    if let Primitive::Node(node) = primitive {
+                        if filter(node.id, node.tags.iter().copied(), covered_nodes, coverage) {
+                            let tags: Vec<String> = node
+                                .tags
+                                .into_iter()
+                                .flat_map(|(k, v)| [k.to_string(), v.to_string()])
+                                .collect();
+                            if let Some((lon_e7, lat_e7)) = round_coords(node.lon, node.lat) {
+                                node_tx.send(Node {
+                                    id: node.id,
+                                    tags,
+                                    lon_e7,
+                                    lat_e7,
+                                })?;
+                            }
+                        };
+
+                        // If the current node is referenced by some way or relation, we’ll need its
+                        // coordinates to build the complex (non-point) geometry. Note that this is
+                        // independent of whether the node is “interesting” for our matching purposes.
+                        if (filtered_ways.has_node_ref(node.id)
+                            || filtered_relations.has_node_ref(node.id))
+                            && let Some((_lon_e7, _lat_e7)) = round_coords(node.lon, node.lat)
+                        {
+                            // TODO: Build a coordinates table by sending (node.id, (lon_e7, lat_e7))
+                            // to a channel.
+                        }
                     }
                 }
                 Ok(())
             })
         });
-        let consumer = s.spawn(|| {
-            for _node in node_rx {
-                num_results += 1;
+
+        let node_writer = s.spawn(|| {
+            let mut serializer = rmp_serde::Serializer::new(Vec::<u8>::with_capacity(32768));
+            let mut data_writer = BufWriter::new(File::create(&filtered_nodes_data_path)?);
+            let mut offsets_writer = BufWriter::new(File::create(&filtered_nodes_offsets_path)?);
+            let mut cur_offset = 0_u64;
+            for node in node_rx {
+                serializer.get_mut().clear();
+                node.serialize(&mut serializer)?;
+                let buf = serializer.get_ref();
+                data_writer.write_all(buf)?;
+                offsets_writer.write_all(&cur_offset.to_le_bytes())?;
+                cur_offset += buf.len() as u64;
+                num_nodes += 1;
             }
+            data_writer.into_inner()?.sync_all()?;
+            offsets_writer.into_inner()?.sync_all()?;
             Ok(())
         });
+
         producer
             .join()
             .expect("panic in filter_nodes producer")
             .and(handler.join().expect("panic in filter_nodes handler"))
-            .and(consumer.join().expect("panic in filter_nodes consumer"))
+            .and(
+                node_writer
+                    .join()
+                    .expect("panic in filter_nodes node_writer"),
+            )
     })?;
-    progress_bar.finish_with_message(format!("blobs → {} nodes", num_results));
 
-    Ok(out)
+    let mut tmp_out = PathBuf::from(&out_path);
+    tmp_out.add_extension("tmp");
+
+    let mut writer = filtered_file::Writer::create(&tmp_out)?;
+    writer.write_features(&filtered_nodes_data_path, &filtered_nodes_offsets_path)?;
+    writer.close()?;
+
+    remove_file(&filtered_nodes_data_path)?;
+    remove_file(&filtered_nodes_offsets_path)?;
+    rename(&tmp_out, &out_path)?;
+
+    progress_bar.finish_with_message(format!("blobs → {} nodes", num_nodes));
+
+    Ok(FilteredFile::open(&out_path)?)
+}
+
+/// Helper for `filter_nodes()`.
+fn round_coords(lon: f64, lat: f64) -> Option<(i32, i32)> {
+    if (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon) {
+        Some(((lon * 1e7).round() as i32, (lat * 1e7).round() as i32))
+    } else {
+        None
+    }
 }
 
 fn filter<'a, I>(id: u64, tags: I, covered_ids: &U64Table, coverage: &Coverage) -> bool
@@ -364,12 +459,155 @@ where
 }
 
 mod filtered_file {
-    use anyhow::{Ok, Result};
+    use anyhow::{Ok, Result, anyhow};
+    use memmap2::Mmap;
     use std::fs::File;
     use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
     use std::path::Path;
 
     const BUFFER_SIZE: usize = 256 * 1024;
+
+    pub struct FilteredFile<'a> {
+        /// Backing store for `mmap`.
+        _file: File,
+
+        /// Backing store for memory-mapped slices.
+        _mmap: Mmap,
+
+        #[allow(unused)] // TODO: Remove attribute once we use the features.
+        feature_data: &'a [u8],
+
+        #[allow(unused)] // TODO: Remove attribute once we use the features.
+        feature_offsets: &'a [u64],
+
+        node_refs: &'a [u64],
+        way_refs: &'a [u64],
+    }
+
+    impl<'a> FilteredFile<'a> {
+        pub fn open(path: &Path) -> Result<FilteredFile<'a>> {
+            let file = File::open(path)?;
+
+            // SAFETY: We don’t truncate the file while it’s mapped into memory.
+            let mmap = unsafe { Mmap::map(&file)? };
+
+            Self::check_signature(&mmap)?;
+
+            let feature_data = {
+                if let Some((offset, size)) =
+                    Self::get_offset_size(b"fea_data", &mmap, /* alignment */ 1)
+                {
+                    // SAFETY: Bounds checked by get_offset_size(); no alignment constraints.
+                    unsafe { std::slice::from_raw_parts(mmap.as_ptr().add(offset), size) }
+                } else {
+                    &[]
+                }
+            };
+
+            let node_refs = {
+                if let Some((offset, size)) =
+                    Self::get_offset_size(b"nod_refs", &mmap, /* alignment */ 8)
+                {
+                    // SAFETY: Bounds and alignment checked by get_offset_size().
+                    unsafe {
+                        let ptr = mmap.as_ptr().add(offset) as *const u64;
+                        std::slice::from_raw_parts(ptr, size / 8)
+                    }
+                } else {
+                    &[]
+                }
+            };
+
+            let feature_offsets = {
+                if let Some((offset, size)) =
+                    Self::get_offset_size(b"fea_offs", &mmap, /* alignment */ 8)
+                {
+                    // SAFETY: Bounds and alignment checked by get_offset_size().
+                    unsafe {
+                        let ptr = mmap.as_ptr().add(offset) as *const u64;
+                        std::slice::from_raw_parts(ptr, size / 8)
+                    }
+                } else {
+                    &[]
+                }
+            };
+
+            let way_refs = {
+                if let Some((offset, size)) =
+                    Self::get_offset_size(b"way_refs", &mmap, /* alignment */ 8)
+                {
+                    // SAFETY: Bounds and alignment checked by get_offset_size().
+                    unsafe {
+                        let ptr = mmap.as_ptr().add(offset) as *const u64;
+                        std::slice::from_raw_parts(ptr, size / 8)
+                    }
+                } else {
+                    &[]
+                }
+            };
+
+            Ok(FilteredFile {
+                _file: file,
+                _mmap: mmap,
+                feature_data,
+                feature_offsets,
+                node_refs,
+                way_refs,
+            })
+        }
+
+        pub fn has_node_ref(&self, node_id: u64) -> bool {
+            if cfg!(target_endian = "little") {
+                self.node_refs.binary_search(&node_id).is_ok()
+            } else {
+                self.node_refs
+                    .binary_search_by(|x| x.swap_bytes().cmp(&node_id))
+                    .is_ok()
+            }
+        }
+
+        pub fn has_way_ref(&self, way_id: u64) -> bool {
+            if cfg!(target_endian = "little") {
+                self.way_refs.binary_search(&way_id).is_ok()
+            } else {
+                self.way_refs
+                    .binary_search_by(|x| x.swap_bytes().cmp(&way_id))
+                    .is_ok()
+            }
+        }
+
+        fn check_signature(data: &[u8]) -> Result<()> {
+            if data.len() < 32 || &data[0..24] != b"diffed-places filtered\0\0" {
+                return Err(anyhow!("malformed filtered file"));
+            }
+            Ok(())
+        }
+
+        fn get_offset_size(key: &[u8; 8], data: &[u8], alignment: usize) -> Option<(usize, usize)> {
+            let header_pos = u64::from_le_bytes(data[24..32].try_into().ok()?);
+            let p = usize::try_from(header_pos).ok()?;
+            let num_headers_u64 = u64::from_le_bytes(data[p..p + 8].try_into().ok()?);
+            let num_headers = usize::try_from(num_headers_u64).ok()?;
+            for i in 0..num_headers {
+                let o = p + 8 + i * 24;
+                if o + 8 <= data.len() && *key == data[o..o + 8] {
+                    let offset =
+                        usize::try_from(u64::from_le_bytes(data[o + 8..o + 16].try_into().ok()?))
+                            .ok()?;
+                    let len =
+                        usize::try_from(u64::from_le_bytes(data[o + 16..o + 24].try_into().ok()?))
+                            .ok()?;
+                    if offset + len <= data.len()
+                        && offset.is_multiple_of(alignment)
+                        && len.is_multiple_of(alignment)
+                    {
+                        return Some((offset, len));
+                    };
+                }
+            }
+            None
+        }
+    }
 
     pub struct Writer {
         writer: BufWriter<File>,
@@ -452,5 +690,124 @@ mod filtered_file {
             }
             Ok(())
         }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::FilteredFile;
+
+        #[test]
+        fn test_check_signature() {
+            assert!(
+                FilteredFile::check_signature(b"diffed-places filtered\0\0\0\0\0\0\0\0\0\0")
+                    .is_ok()
+            );
+            assert!(FilteredFile::check_signature(b"").is_err());
+            assert!(FilteredFile::check_signature(b"foo").is_err());
+            assert!(FilteredFile::check_signature(b"diffed-places coverage\0\x01").is_err());
+            assert!(FilteredFile::check_signature(b"diffed-places coverage\0\0\0\0\0\0").is_err());
+        }
+
+        #[test]
+        fn test_get_offset_size() {
+            // Construct a coverage file with two keys in its header.
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"diffed-places filtered\0\0"); // [0..24]: signature
+            bytes.extend_from_slice(&48_u64.to_le_bytes()); // [24..32]: header_pos
+            bytes.extend_from_slice(&0xdeadbeefcafefeed_u64.to_le_bytes()); // [32..40]: data[0]
+            bytes.extend_from_slice(&42_u64.to_le_bytes()); // [40..48]: data[1]
+            bytes.extend_from_slice(&2_u64.to_le_bytes()); // [48..56]: num_headers
+            assert!(FilteredFile::get_offset_size(b"some_key", &bytes, 1) == None);
+            for (key, offset, size) in [(b"some_key", 88, 16), (b"otherkey", 91, 2)] {
+                bytes.extend_from_slice(key as &[u8; 8]);
+                bytes.extend_from_slice(&(offset as u64).to_le_bytes());
+                bytes.extend_from_slice(&(size as u64).to_le_bytes());
+            }
+
+            let bytes = bytes.as_ref();
+
+            // The file header has no entry for key "in-exist".
+            assert_eq!(FilteredFile::get_offset_size(b"in-exist", bytes, 1), None);
+
+            // The data for "some_key" starts at offset 88 and is 16 bytes, which is
+            // correctly aligned for single-byte, 8-byte and 16-byte access.
+            assert_eq!(
+                FilteredFile::get_offset_size(b"some_key", bytes, 1),
+                Some((88, 16))
+            );
+            assert_eq!(
+                FilteredFile::get_offset_size(b"some_key", bytes, 2),
+                Some((88, 16))
+            );
+            assert_eq!(
+                FilteredFile::get_offset_size(b"some_key", bytes, 8),
+                Some((88, 16))
+            );
+
+            // However, it would be unsafe (at least on RISC CPUs) to perform 32-byte
+            // access, eg. loading a SIMD register, because 80 is not divisible by 32.
+            // Also, the data size is too small to read 32-byte entitites anyway.
+            assert_eq!(FilteredFile::get_offset_size(b"some_key", bytes, 32), None);
+
+            // The data for "otherkey" starts at offset 91 and is 2 bytes long.
+            // Access is only safe with single-byte alignment.
+            assert_eq!(
+                FilteredFile::get_offset_size(b"otherkey", bytes, 1),
+                Some((91, 2))
+            );
+            assert_eq!(FilteredFile::get_offset_size(b"otherkey", bytes, 2), None);
+            assert_eq!(FilteredFile::get_offset_size(b"otherkey", bytes, 8), None);
+        }
+    }
+
+    #[test]
+    fn test_node_refs() -> Result<()> {
+        let tmp = tempfile::NamedTempFile::new()?;
+        let mut writer = Writer::create(tmp.path())?;
+        writer.write_node_refs(&{
+            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("tests/test_data/u64_le_0_2_7");
+            p
+        })?;
+        writer.close()?;
+        let ff = FilteredFile::open(tmp.path())?;
+        assert_eq!(ff.has_node_ref(0), true);
+        assert_eq!(ff.has_node_ref(2), true);
+        assert_eq!(ff.has_node_ref(7), true);
+        assert_eq!(ff.has_node_ref(1), false);
+        assert_eq!(ff.has_node_ref(8), false);
+        assert_eq!(ff.has_node_ref(1234567890123456789), false);
+        Ok(())
+    }
+
+    #[test]
+    fn test_way_refs() -> Result<()> {
+        let tmp = tempfile::NamedTempFile::new()?;
+        let mut writer = Writer::create(tmp.path())?;
+        writer.write_way_refs(&{
+            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("tests/test_data/u64_le_0_2_7");
+            p
+        })?;
+        writer.close()?;
+        let ff = FilteredFile::open(tmp.path())?;
+        assert_eq!(ff.has_way_ref(0), true);
+        assert_eq!(ff.has_way_ref(2), true);
+        assert_eq!(ff.has_way_ref(7), true);
+        assert_eq!(ff.has_way_ref(1), false);
+        assert_eq!(ff.has_way_ref(8), false);
+        assert_eq!(ff.has_way_ref(1234567890123456789), false);
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty() -> Result<()> {
+        let tmp = tempfile::NamedTempFile::new()?;
+        let writer = Writer::create(tmp.path())?;
+        writer.close()?;
+        let ff = FilteredFile::open(tmp.path())?;
+        assert_eq!(ff.has_node_ref(123), false);
+        assert_eq!(ff.has_way_ref(789), false);
+        Ok(())
     }
 }

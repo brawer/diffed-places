@@ -54,32 +54,35 @@ pub fn import_osm(
         workdir,
     )?;
 
-    let _filtered_relations = filter::filter_relations(
+    let filtered_relations = filter::filter_relations(
         &mut reader,
         rel_blobs,
         &coverage,
         &covered_relations,
         progress,
         workdir,
-    );
+    )?;
 
-    let _filtered_ways = filter::filter_ways(
+    let filtered_ways = filter::filter_ways(
         &mut reader,
         way_blobs,
         &coverage,
         &covered_ways,
+        &filtered_relations,
         progress,
         workdir,
-    );
+    )?;
 
     let _filtered_nodes = filter::filter_nodes(
         &mut reader,
         node_blobs,
         &coverage,
         &covered_nodes,
+        &filtered_ways,
+        &filtered_relations,
         progress,
         workdir,
-    );
+    )?;
 
     Ok(())
 }

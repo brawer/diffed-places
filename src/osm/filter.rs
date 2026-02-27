@@ -1,4 +1,4 @@
-use super::BlobReader;
+use super::{BlobReader, coords::Coords};
 use crate::coverage::{Coverage, is_wikidata_key, parse_wikidata_ids};
 use crate::{u64_table, u64_table::U64Table};
 use anyhow::{Ok, Result};
@@ -329,20 +329,26 @@ pub fn filter_nodes<'a, R: Read + Seek + Send>(
         return Ok(FilteredFile::open(&out_path)?);
     }
 
+    let coord_keys_path = workdir.join("osm-filtered-nodes.coords.keys.tmp");
+    let coord_data_path = workdir.join("osm-filtered-nodes.coords.data.tmp");
     let filtered_nodes_data_path = workdir.join("osm-filtered-nodes.data.tmp");
     let filtered_nodes_offsets_path = workdir.join("osm-filtered-nodes.offsets.tmp");
 
     let num_blobs = (blobs.1 - blobs.0) as u64;
+    let mut num_coords = 0;
     let mut num_nodes = 0;
+
     let progress_bar =
         super::make_progress_bar(progress, "osm.filter.n", num_blobs, "blobs → nodes");
     thread::scope(|s| {
         let num_workers = usize::from(thread::available_parallelism()?);
         let (blob_tx, blob_rx) = sync_channel::<Blob>(num_workers);
-        let (node_tx, node_rx) = sync_channel::<Node>(2048);
+        let (node_tx, node_rx) = sync_channel::<Node>(8192);
+        let (coords_tx, coords_rx) = sync_channel::<Coords>(8192);
         let producer = s.spawn(|| super::read_blobs(reader, blobs, &progress_bar, blob_tx));
         let handler = s.spawn(move || {
             blob_rx.into_iter().par_bridge().try_for_each(|blob| {
+                let coords_tx = coords_tx.clone();
                 let node_tx = node_tx.clone();
                 let data = blob.into_data(); // decompress
                 let block = PrimitiveBlock::parse(&data);
@@ -369,15 +375,28 @@ pub fn filter_nodes<'a, R: Read + Seek + Send>(
                         // independent of whether the node is “interesting” for our matching purposes.
                         if (filtered_ways.has_node_ref(node.id)
                             || filtered_relations.has_node_ref(node.id))
-                            && let Some((_lon_e7, _lat_e7)) = round_coords(node.lon, node.lat)
+                            && let Some((lon_e7, lat_e7)) = round_coords(node.lon, node.lat)
                         {
-                            // TODO: Build a coordinates table by sending (node.id, (lon_e7, lat_e7))
-                            // to a channel.
+                            coords_tx.send(Coords {
+                                key: node.id,
+                                lon_e7,
+                                lat_e7,
+                            })?;
                         }
                     }
                 }
                 Ok(())
             })
+        });
+
+        let coords_writer = s.spawn(|| {
+            num_coords = super::coords::build_tables(
+                coords_rx,
+                workdir,
+                &coord_keys_path,
+                &coord_data_path,
+            )?;
+            Ok(())
         });
 
         let node_writer = s.spawn(|| {
@@ -404,6 +423,11 @@ pub fn filter_nodes<'a, R: Read + Seek + Send>(
             .expect("panic in filter_nodes producer")
             .and(handler.join().expect("panic in filter_nodes handler"))
             .and(
+                coords_writer
+                    .join()
+                    .expect("panic in filter_nodes coords_writer"),
+            )
+            .and(
                 node_writer
                     .join()
                     .expect("panic in filter_nodes node_writer"),
@@ -415,13 +439,20 @@ pub fn filter_nodes<'a, R: Read + Seek + Send>(
 
     let mut writer = filtered_file::Writer::create(&tmp_out)?;
     writer.write_features(&filtered_nodes_data_path, &filtered_nodes_offsets_path)?;
+    writer.write_coords(&coord_keys_path, &coord_data_path)?;
     writer.close()?;
 
     remove_file(&filtered_nodes_data_path)?;
     remove_file(&filtered_nodes_offsets_path)?;
+    remove_file(&coord_keys_path)?;
+    remove_file(&coord_data_path)?;
+
     rename(&tmp_out, &out_path)?;
 
-    progress_bar.finish_with_message(format!("blobs → {} nodes", num_nodes));
+    progress_bar.finish_with_message(format!(
+        "blobs → {} coords, {} nodes",
+        num_coords, num_nodes
+    ));
 
     Ok(FilteredFile::open(&out_path)?)
 }
@@ -460,6 +491,7 @@ where
 
 mod filtered_file {
     use anyhow::{Ok, Result, anyhow};
+    use geo_types::Point;
     use memmap2::Mmap;
     use std::fs::File;
     use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
@@ -480,6 +512,12 @@ mod filtered_file {
         #[allow(unused)] // TODO: Remove attribute once we use the features.
         feature_offsets: &'a [u64],
 
+        #[allow(unused)] // TODO: Remove attribute once we use the coordinates.
+        coord_keys: &'a [u64],
+
+        #[allow(unused)] // TODO: Remove attribute once we use the coordinates.
+        coord_data: &'a [i32],
+
         node_refs: &'a [u64],
         way_refs: &'a [u64],
     }
@@ -492,6 +530,34 @@ mod filtered_file {
             let mmap = unsafe { Mmap::map(&file)? };
 
             Self::check_signature(&mmap)?;
+
+            let coord_keys = {
+                if let Some((offset, size)) =
+                    Self::get_offset_size(b"coo_keys", &mmap, /* alignment */ 8)
+                {
+                    // SAFETY: Bounds and alignment checked by get_offset_size().
+                    unsafe {
+                        let ptr = mmap.as_ptr().add(offset) as *const u64;
+                        std::slice::from_raw_parts(ptr, size / 8)
+                    }
+                } else {
+                    &[]
+                }
+            };
+
+            let coord_data = {
+                if let Some((offset, size)) =
+                    Self::get_offset_size(b"coo_data", &mmap, /* alignment */ 4)
+                {
+                    // SAFETY: Bounds and alignment checked by get_offset_size().
+                    unsafe {
+                        let ptr = mmap.as_ptr().add(offset) as *const i32;
+                        std::slice::from_raw_parts(ptr, size / 4)
+                    }
+                } else {
+                    &[]
+                }
+            };
 
             let feature_data = {
                 if let Some((offset, size)) =
@@ -549,11 +615,30 @@ mod filtered_file {
             Ok(FilteredFile {
                 _file: file,
                 _mmap: mmap,
+                coord_keys,
+                coord_data,
                 feature_data,
                 feature_offsets,
                 node_refs,
                 way_refs,
             })
+        }
+
+        #[allow(unused)] // TODO: Remove attribute once we use the coordinates.
+        pub fn get_coords(&self, node_id: u64) -> Option<Point> {
+            let index = if cfg!(target_endian = "little") {
+                self.coord_keys.binary_search(&node_id)
+            } else {
+                self.coord_keys
+                    .binary_search_by(|x| x.swap_bytes().cmp(&node_id))
+            };
+            if let Result::Ok(i) = index {
+                let lon = self.coord_data[i * 2] as f64 / 1e7;
+                let lat = self.coord_data[i * 2 + 1] as f64 / 1e7;
+                Some(Point::new(lon, lat))
+            } else {
+                None
+            }
         }
 
         pub fn has_node_ref(&self, node_id: u64) -> bool {
@@ -631,6 +716,14 @@ mod filtered_file {
             let (offsets_start, offsets_len) = self.write_file(offsets, /* alignment */ 8)?;
             self.headers.push((b"fea_data", data_start, data_len));
             self.headers.push((b"fea_offs", offsets_start, offsets_len));
+            Ok(())
+        }
+
+        pub fn write_coords(&mut self, keys: &Path, data: &Path) -> Result<()> {
+            let (keys_start, keys_len) = self.write_file(keys, /* alignment */ 8)?;
+            let (data_start, data_len) = self.write_file(data, /* alignment */ 4)?;
+            self.headers.push((b"coo_keys", keys_start, keys_len));
+            self.headers.push((b"coo_data", data_start, data_len));
             Ok(())
         }
 
@@ -761,6 +854,34 @@ mod filtered_file {
     }
 
     #[test]
+    fn test_coords() -> Result<()> {
+        let tmp = tempfile::NamedTempFile::new()?;
+        let mut writer = Writer::create(tmp.path())?;
+        let keys_path = {
+            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("tests/test_data/u64_le_0_2_7");
+            p
+        };
+        let data = tempfile::NamedTempFile::new()?;
+        {
+            let mut file = File::create(data.path())?;
+            for i in 1_i32..=6_i32 {
+                file.write_all(&i.to_le_bytes())?;
+            }
+            file.sync_all()?;
+        }
+        writer.write_coords(&keys_path, &data.path())?;
+        writer.close()?;
+        let ff = FilteredFile::open(tmp.path())?;
+        assert_eq!(ff.get_coords(0), Some(Point::new(0.0000001, 0.0000002)));
+        assert_eq!(ff.get_coords(1), None);
+        assert_eq!(ff.get_coords(2), Some(Point::new(0.0000003, 0.0000004)));
+        assert_eq!(ff.get_coords(7), Some(Point::new(0.0000005, 0.0000006)));
+        assert_eq!(ff.get_coords(99), None);
+        Ok(())
+    }
+
+    #[test]
     fn test_node_refs() -> Result<()> {
         let tmp = tempfile::NamedTempFile::new()?;
         let mut writer = Writer::create(tmp.path())?;
@@ -806,6 +927,7 @@ mod filtered_file {
         let writer = Writer::create(tmp.path())?;
         writer.close()?;
         let ff = FilteredFile::open(tmp.path())?;
+        assert_eq!(ff.get_coords(5), None);
         assert_eq!(ff.has_node_ref(123), false);
         assert_eq!(ff.has_way_ref(789), false);
         Ok(())

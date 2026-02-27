@@ -13,6 +13,7 @@ use std::thread;
 use crate::PROGRESS_BAR_STYLE;
 use crate::coverage::Coverage;
 
+mod coords;
 mod cover;
 mod filter;
 

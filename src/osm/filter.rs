@@ -491,7 +491,7 @@ where
 
 mod filtered_file {
     use anyhow::{Ok, Result, anyhow};
-    use geo_types::Point;
+    use geo::Point;
     use memmap2::Mmap;
     use std::fs::File;
     use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};

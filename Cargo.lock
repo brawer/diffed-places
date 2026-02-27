@@ -586,7 +586,6 @@ dependencies = [
  "ext-sort",
  "geo",
  "geo-traits",
- "geo-types",
  "geojson",
  "indicatif",
  "log",

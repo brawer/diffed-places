@@ -1,5 +1,5 @@
 use deepsize::DeepSizeOf;
-use geo_types::Point;
+use geo::Point;
 use serde::{Deserialize, Serialize};
 
 mod writer;

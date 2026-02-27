@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-arrow = { version = "57.3.0", default-features = false }
+arrow = { version = "58.0.0", default-features = false }
 clap = { version = "4.5.60", default-features = false, features = ["derive", "std"] }
 deepsize = "0.2.0"
 deepsize_derive = "0.1.2"
@@ -19,7 +19,7 @@ indicatif = { version = "0.18.4", default-features = false }
 log = { version = "0.4.29", default-features = false }
 memmap2 = "0.9.10"
 osm_pbf_iter = { version = "0.2.1", default-features = false }
-parquet = { version = "57.3.0", default-features = false, features = ["arrow", "zstd"] }
+parquet = { version = "58.0.0", default-features = false, features = ["arrow", "zstd"] }
 piz = "0.5.1"
 protobuf_iter = { version = "0.1.3", default-features = false }
 rayon = "1.11.0"

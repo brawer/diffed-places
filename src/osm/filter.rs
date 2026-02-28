@@ -193,6 +193,12 @@ pub fn filter_ways<'a, R: Read + Seek + Send>(
     let filtered_ways_offsets_path = workdir.join("osm-filtered-ways.offsets.tmp");
     let node_refs_path = workdir.join("osm-filtered-ways.node-refs.tmp");
 
+    // Mapping from osm way id to the feature index in the osm-filter-ways file.
+    // Only populated for those ways that are referenced from at least one relation
+    // in `osm-filtered-relations`. Needed to build the geometry of OpenStreetMap relations.
+    let index_keys_path = workdir.join("osm-filtered-ways.index.keys.tmp");
+    let index_data_path = workdir.join("osm-filtered-ways.index.data.tmp");
+
     let num_blobs = (blobs.1 - blobs.0) as u64;
     let mut num_ways = 0;
     let mut num_node_refs = 0;
@@ -253,6 +259,11 @@ pub fn filter_ways<'a, R: Read + Seek + Send>(
             let mut data_writer = BufWriter::new(File::create(&filtered_ways_data_path)?);
             let mut offsets_writer = BufWriter::new(File::create(&filtered_ways_offsets_path)?);
             let mut cur_offset = 0_u64;
+
+            // Only 219K entries with OpenStreetMap planet 2026-01-19 and AllThePlaces 2026-01-03;
+            // too small to bother with external sorting.
+            let mut feature_index = Vec::<(u64, u64)>::new();
+
             for way in way_rx {
                 serializer.get_mut().clear();
                 way.serialize(&mut serializer)?;
@@ -260,10 +271,24 @@ pub fn filter_ways<'a, R: Read + Seek + Send>(
                 data_writer.write_all(buf)?;
                 offsets_writer.write_all(&cur_offset.to_le_bytes())?;
                 cur_offset += buf.len() as u64;
+                if filtered_relations.has_way_ref(way.id) {
+                    feature_index.push((way.id, num_ways));
+                }
                 num_ways += 1;
             }
             data_writer.into_inner()?.sync_all()?;
             offsets_writer.into_inner()?.sync_all()?;
+
+            let mut index_keys_writer = BufWriter::new(File::create(&index_keys_path)?);
+            let mut index_data_writer = BufWriter::new(File::create(&index_data_path)?);
+            feature_index.sort();
+            for w in feature_index {
+                index_keys_writer.write_all(&w.0.to_le_bytes())?;
+                index_data_writer.write_all(&w.1.to_le_bytes())?;
+            }
+            index_keys_writer.into_inner()?.sync_all()?;
+            index_data_writer.into_inner()?.sync_all()?;
+
             Ok(())
         });
 
@@ -292,11 +317,14 @@ pub fn filter_ways<'a, R: Read + Seek + Send>(
 
     let mut writer = filtered_file::Writer::create(&tmp_out)?;
     writer.write_features(&filtered_ways_data_path, &filtered_ways_offsets_path)?;
+    writer.write_feature_index(&index_keys_path, &index_data_path)?;
     writer.write_node_refs(&node_refs_path)?;
     writer.close()?;
 
     remove_file(&filtered_ways_data_path)?;
     remove_file(&filtered_ways_offsets_path)?;
+    remove_file(&index_keys_path)?;
+    remove_file(&index_data_path)?;
     remove_file(&node_refs_path)?;
     rename(&tmp_out, &out_path)?;
 
@@ -506,20 +534,42 @@ mod filtered_file {
         /// Backing store for memory-mapped slices.
         _mmap: Mmap,
 
+        /// Present in all filtered files (for nodes, ways and relations).
         #[allow(unused)] // TODO: Remove attribute once we use the features.
         feature_data: &'a [u8],
 
+        /// Present in all filtered files (for nodes, ways and relations).
         #[allow(unused)] // TODO: Remove attribute once we use the features.
         feature_offsets: &'a [u64],
 
+        /// Present in `osm-filtered-nodes`.
         #[allow(unused)] // TODO: Remove attribute once we use the coordinates.
         coord_keys: &'a [u64],
 
+        /// Present in `osm-filtered-nodes`.
         #[allow(unused)] // TODO: Remove attribute once we use the coordinates.
         coord_data: &'a [i32],
 
+        /// Present in `osm-filtered-ways` and `osm-filtered-relations`.
         node_refs: &'a [u64],
+
+        /// Present in `osm-filtered-relations`.
         way_refs: &'a [u64],
+
+        /// OpenStreetMap ID of the features in this file, in increasing order.
+        /// At the moment, this is only present in `osm-filtered-ways`,
+        /// and only for those ways that are referenced from relations,
+        /// since we don't need to look up nodes and relations by their ID.
+        #[allow(unused)] // TODO: Remove attribute once we use it.
+        feature_index_keys: &'a [u64],
+
+        /// Parallel array to `feature_index_keys`, containing the index
+        /// of the corresponding feature in the `feature_offsets` array.
+        /// At the moment, this is only present in `osm-filtered-ways`,
+        /// and only for those ways that are referenced from relations,
+        /// since we don't need to look up nodes and relations by their ID.
+        #[allow(unused)] // TODO: Remove attribute once we use it.
+        feature_index_data: &'a [u64],
     }
 
     impl<'a> FilteredFile<'a> {
@@ -570,9 +620,9 @@ mod filtered_file {
                 }
             };
 
-            let node_refs = {
+            let feature_offsets = {
                 if let Some((offset, size)) =
-                    Self::get_offset_size(b"nod_refs", &mmap, /* alignment */ 8)
+                    Self::get_offset_size(b"fea_offs", &mmap, /* alignment */ 8)
                 {
                     // SAFETY: Bounds and alignment checked by get_offset_size().
                     unsafe {
@@ -584,9 +634,9 @@ mod filtered_file {
                 }
             };
 
-            let feature_offsets = {
+            let node_refs = {
                 if let Some((offset, size)) =
-                    Self::get_offset_size(b"fea_offs", &mmap, /* alignment */ 8)
+                    Self::get_offset_size(b"nod_refs", &mmap, /* alignment */ 8)
                 {
                     // SAFETY: Bounds and alignment checked by get_offset_size().
                     unsafe {
@@ -612,6 +662,34 @@ mod filtered_file {
                 }
             };
 
+            let feature_index_keys = {
+                if let Some((offset, size)) =
+                    Self::get_offset_size(b"fea_id_k", &mmap, /* alignment */ 8)
+                {
+                    // SAFETY: Bounds and alignment checked by get_offset_size().
+                    unsafe {
+                        let ptr = mmap.as_ptr().add(offset) as *const u64;
+                        std::slice::from_raw_parts(ptr, size / 8)
+                    }
+                } else {
+                    &[]
+                }
+            };
+
+            let feature_index_data = {
+                if let Some((offset, size)) =
+                    Self::get_offset_size(b"fea_id_v", &mmap, /* alignment */ 8)
+                {
+                    // SAFETY: Bounds and alignment checked by get_offset_size().
+                    unsafe {
+                        let ptr = mmap.as_ptr().add(offset) as *const u64;
+                        std::slice::from_raw_parts(ptr, size / 8)
+                    }
+                } else {
+                    &[]
+                }
+            };
+
             Ok(FilteredFile {
                 _file: file,
                 _mmap: mmap,
@@ -621,6 +699,8 @@ mod filtered_file {
                 feature_offsets,
                 node_refs,
                 way_refs,
+                feature_index_keys,
+                feature_index_data,
             })
         }
 
@@ -636,6 +716,21 @@ mod filtered_file {
                 let lon = self.coord_data[i * 2] as f64 / 1e7;
                 let lat = self.coord_data[i * 2 + 1] as f64 / 1e7;
                 Some(Point::new(lon, lat))
+            } else {
+                None
+            }
+        }
+
+        #[allow(unused)] // TODO: Remove attribute once we use this in production code.
+        pub fn feature_index(&self, id: u64) -> Option<u64> {
+            let index = if cfg!(target_endian = "little") {
+                self.feature_index_keys.binary_search(&id)
+            } else {
+                self.feature_index_keys
+                    .binary_search_by(|x| x.swap_bytes().cmp(&id))
+            };
+            if let Result::Ok(i) = index {
+                Some(self.feature_index_data[i])
             } else {
                 None
             }
@@ -719,6 +814,14 @@ mod filtered_file {
             Ok(())
         }
 
+        pub fn write_feature_index(&mut self, keys: &Path, data: &Path) -> Result<()> {
+            let (keys_start, keys_len) = self.write_file(keys, /* alignment */ 8)?;
+            let (data_start, data_len) = self.write_file(data, /* alignment */ 8)?;
+            self.headers.push((b"fea_id_k", keys_start, keys_len));
+            self.headers.push((b"fea_id_v", data_start, data_len));
+            Ok(())
+        }
+
         pub fn write_coords(&mut self, keys: &Path, data: &Path) -> Result<()> {
             let (keys_start, keys_len) = self.write_file(keys, /* alignment */ 8)?;
             let (data_start, data_len) = self.write_file(data, /* alignment */ 4)?;
@@ -787,7 +890,7 @@ mod filtered_file {
 
     #[cfg(test)]
     mod tests {
-        use super::FilteredFile;
+        use super::*;
 
         #[test]
         fn test_check_signature() {
@@ -851,85 +954,99 @@ mod filtered_file {
             assert_eq!(FilteredFile::get_offset_size(b"otherkey", bytes, 2), None);
             assert_eq!(FilteredFile::get_offset_size(b"otherkey", bytes, 8), None);
         }
-    }
 
-    #[test]
-    fn test_coords() -> Result<()> {
-        let tmp = tempfile::NamedTempFile::new()?;
-        let mut writer = Writer::create(tmp.path())?;
-        let keys_path = {
-            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            p.push("tests/test_data/u64_le_0_2_7");
-            p
-        };
-        let data = tempfile::NamedTempFile::new()?;
-        {
-            let mut file = File::create(data.path())?;
-            for i in 1_i32..=6_i32 {
-                file.write_all(&i.to_le_bytes())?;
+        #[test]
+        fn test_coords() -> Result<()> {
+            let tmp = tempfile::NamedTempFile::new()?;
+            let mut writer = Writer::create(tmp.path())?;
+            let keys_path = test_data_path("u64_le_0_2_7");
+            let data = tempfile::NamedTempFile::new()?;
+            {
+                let mut file = File::create(data.path())?;
+                for i in 1_i32..=6_i32 {
+                    file.write_all(&i.to_le_bytes())?;
+                }
+                file.sync_all()?;
             }
-            file.sync_all()?;
+            writer.write_coords(&keys_path, &data.path())?;
+            writer.close()?;
+            let ff = FilteredFile::open(tmp.path())?;
+            assert_eq!(ff.get_coords(0), Some(Point::new(0.0000001, 0.0000002)));
+            assert_eq!(ff.get_coords(1), None);
+            assert_eq!(ff.get_coords(2), Some(Point::new(0.0000003, 0.0000004)));
+            assert_eq!(ff.get_coords(7), Some(Point::new(0.0000005, 0.0000006)));
+            assert_eq!(ff.get_coords(99), None);
+            Ok(())
         }
-        writer.write_coords(&keys_path, &data.path())?;
-        writer.close()?;
-        let ff = FilteredFile::open(tmp.path())?;
-        assert_eq!(ff.get_coords(0), Some(Point::new(0.0000001, 0.0000002)));
-        assert_eq!(ff.get_coords(1), None);
-        assert_eq!(ff.get_coords(2), Some(Point::new(0.0000003, 0.0000004)));
-        assert_eq!(ff.get_coords(7), Some(Point::new(0.0000005, 0.0000006)));
-        assert_eq!(ff.get_coords(99), None);
-        Ok(())
-    }
 
-    #[test]
-    fn test_node_refs() -> Result<()> {
-        let tmp = tempfile::NamedTempFile::new()?;
-        let mut writer = Writer::create(tmp.path())?;
-        writer.write_node_refs(&{
-            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            p.push("tests/test_data/u64_le_0_2_7");
-            p
-        })?;
-        writer.close()?;
-        let ff = FilteredFile::open(tmp.path())?;
-        assert_eq!(ff.has_node_ref(0), true);
-        assert_eq!(ff.has_node_ref(2), true);
-        assert_eq!(ff.has_node_ref(7), true);
-        assert_eq!(ff.has_node_ref(1), false);
-        assert_eq!(ff.has_node_ref(8), false);
-        assert_eq!(ff.has_node_ref(1234567890123456789), false);
-        Ok(())
-    }
+        #[test]
+        fn test_index() -> Result<()> {
+            let tmp = tempfile::NamedTempFile::new()?;
+            let mut writer = Writer::create(tmp.path())?;
+            writer.write_feature_index(
+                &test_data_path("u64_le_0_2_7"),
+                &test_data_path("u64_le_11_23_7"),
+            )?;
+            writer.close()?;
+            let ff = FilteredFile::open(tmp.path())?;
+            assert_eq!(ff.feature_index(0), Some(11));
+            assert_eq!(ff.feature_index(2), Some(23));
+            assert_eq!(ff.feature_index(7), Some(7));
+            assert_eq!(ff.feature_index(1), None);
+            assert_eq!(ff.feature_index(8), None);
+            Ok(())
+        }
 
-    #[test]
-    fn test_way_refs() -> Result<()> {
-        let tmp = tempfile::NamedTempFile::new()?;
-        let mut writer = Writer::create(tmp.path())?;
-        writer.write_way_refs(&{
-            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            p.push("tests/test_data/u64_le_0_2_7");
-            p
-        })?;
-        writer.close()?;
-        let ff = FilteredFile::open(tmp.path())?;
-        assert_eq!(ff.has_way_ref(0), true);
-        assert_eq!(ff.has_way_ref(2), true);
-        assert_eq!(ff.has_way_ref(7), true);
-        assert_eq!(ff.has_way_ref(1), false);
-        assert_eq!(ff.has_way_ref(8), false);
-        assert_eq!(ff.has_way_ref(1234567890123456789), false);
-        Ok(())
-    }
+        #[test]
+        fn test_node_refs() -> Result<()> {
+            let tmp = tempfile::NamedTempFile::new()?;
+            let mut writer = Writer::create(tmp.path())?;
+            writer.write_node_refs(&test_data_path("u64_le_0_2_7"))?;
+            writer.close()?;
+            let ff = FilteredFile::open(tmp.path())?;
+            assert_eq!(ff.has_node_ref(0), true);
+            assert_eq!(ff.has_node_ref(2), true);
+            assert_eq!(ff.has_node_ref(7), true);
+            assert_eq!(ff.has_node_ref(1), false);
+            assert_eq!(ff.has_node_ref(8), false);
+            assert_eq!(ff.has_node_ref(1234567890123456789), false);
+            Ok(())
+        }
 
-    #[test]
-    fn test_empty() -> Result<()> {
-        let tmp = tempfile::NamedTempFile::new()?;
-        let writer = Writer::create(tmp.path())?;
-        writer.close()?;
-        let ff = FilteredFile::open(tmp.path())?;
-        assert_eq!(ff.get_coords(5), None);
-        assert_eq!(ff.has_node_ref(123), false);
-        assert_eq!(ff.has_way_ref(789), false);
-        Ok(())
+        #[test]
+        fn test_way_refs() -> Result<()> {
+            let tmp = tempfile::NamedTempFile::new()?;
+            let mut writer = Writer::create(tmp.path())?;
+            writer.write_way_refs(&test_data_path("u64_le_0_2_7"))?;
+            writer.close()?;
+            let ff = FilteredFile::open(tmp.path())?;
+            assert_eq!(ff.has_way_ref(0), true);
+            assert_eq!(ff.has_way_ref(2), true);
+            assert_eq!(ff.has_way_ref(7), true);
+            assert_eq!(ff.has_way_ref(1), false);
+            assert_eq!(ff.has_way_ref(8), false);
+            assert_eq!(ff.has_way_ref(1234567890123456789), false);
+            Ok(())
+        }
+
+        #[test]
+        fn test_empty() -> Result<()> {
+            let tmp = tempfile::NamedTempFile::new()?;
+            let writer = Writer::create(tmp.path())?;
+            writer.close()?;
+            let ff = FilteredFile::open(tmp.path())?;
+            assert_eq!(ff.get_coords(5), None);
+            assert_eq!(ff.has_node_ref(123), false);
+            assert_eq!(ff.has_way_ref(789), false);
+            Ok(())
+        }
+
+        fn test_data_path(filename: &str) -> std::path::PathBuf {
+            let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            path.push("tests");
+            path.push("test_data");
+            path.push(filename);
+            path
+        }
     }
 }

@@ -1035,10 +1035,22 @@ mod filtered_file {
             let writer = Writer::create(tmp.path())?;
             writer.close()?;
             let ff = FilteredFile::open(tmp.path())?;
+            assert_eq!(ff.feature_index(7), None);
             assert_eq!(ff.get_coords(5), None);
             assert_eq!(ff.has_node_ref(123), false);
             assert_eq!(ff.has_way_ref(789), false);
             Ok(())
+        }
+
+        #[test]
+        fn test_round_coords() {
+            use crate::osm::filter::round_coords;
+            assert_eq!(round_coords(8.2, 47.5), Some((82000000, 475000000)));
+            assert_eq!(round_coords(-8.2, -47.5), Some((-82000000, -475000000)));
+            assert_eq!(round_coords(8.2, 90.5), None);
+            assert_eq!(round_coords(8.2, -90.5), None);
+            assert_eq!(round_coords(180.2, 47.5), None);
+            assert_eq!(round_coords(-180.2, 47.5), None);
         }
 
         fn test_data_path(filename: &str) -> std::path::PathBuf {
